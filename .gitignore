@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# IDE
+.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backtest artifacts / large data dumps
+other_src/backtest_analysis_30d.json
+other_src/backtest_data_*.json
+other_src/backtest_run_data_*.jsonl
+
+# Runtime state
+strategy_state.json
