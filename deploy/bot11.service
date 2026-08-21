@@ -1,0 +1,65 @@
+# systemd unit for the Bot11 orchestrator (server_src/orchestrator.py).
+#
+# Install:
+#   sudo cp deploy/bot11.service /etc/systemd/system/bot11.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bot11
+#
+# Logs:
+#   journalctl -u bot11 -f
+#   Also written as JSON Lines to a rotating file at
+#   $LOGS_DIRECTORY/bot11.jsonl (10MB x 5 backups) -- see LogsDirectory=
+#   below and orchestrator.py::main(). Override the path with LOG_FILE_PATH
+#   in .env, or set it to an empty string to disable the file and keep
+#   stdout/journal-only.
+#
+# Before enabling, adjust the paths/user below to match the server, and
+# confirm server_src/.env exists there with real (non-"changeme") values --
+# main() calls load_dotenv() with no args, which resolves relative to the
+# process's working directory, so WorkingDirectory must stay pointed at
+# server_src for it to find .env automatically.
+
+[Unit]
+Description=Bot11 Polymarket/Binance trading orchestrator
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=bot11
+Group=bot11
+WorkingDirectory=/opt/bot11/server_src
+ExecStart=/opt/bot11/.venv/bin/python orchestrator.py
+Environment=PYTHONUNBUFFERED=1
+
+# Creates/owns a writable /var/log/bot11, exposed to the process as
+# $LOGS_DIRECTORY, without loosening ProtectSystem=strict for anything else.
+LogsDirectory=bot11
+
+Restart=on-failure
+RestartSec=5
+
+# StartLimitIntervalSec/Burst above stop a crash-loop after 5 restarts in 10
+# minutes rather than hammering Binance/Polymarket/Telegram indefinitely --
+# check `systemctl status bot11` for "start-limit-hit" and read the journal
+# before re-enabling, especially if EXECUTION_MODE=live.
+
+# Hardening -- the process only needs outbound network, its own venv/source
+# tree read-only, and the one writable LogsDirectory= path above (all other
+# state stays in-memory), so the rest of the filesystem can stay read-only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bot11
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,113 @@
+"""Event dataclasses emitted by the Datastream-Layer.
+
+Every event carries a `timestamp` (unix seconds, when it was received or
+derived locally) so downstream layers can reason about latency/ordering
+without parsing source-specific message formats. Each source/kind of event
+gets its own frozen dataclass so consumers can dispatch on type, e.g.:
+
+    match event:
+        case BinanceKlineEvent():
+            ...
+        case WindowOpenEvent():
+            ...
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+class Side(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class Outcome(str, Enum):
+    UP = "Up"
+    DOWN = "Down"
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    timestamp: float
+
+
+# ---------------------------------------------------------------------------
+# Binance
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class BinanceKlineEvent(Event):
+    symbol: str
+    interval: str
+    kline_open_time: float
+    kline_close_time: float
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    is_closed: bool
+
+
+# ---------------------------------------------------------------------------
+# Polymarket BTC 5-min window lifecycle
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class WindowOpenEvent(Event):
+    slug: str
+    condition_id: str
+    window_start: float
+    window_end: float
+    up_token_id: str
+    down_token_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WindowCloseEvent(Event):
+    slug: str
+    condition_id: str
+    window_start: float
+    window_end: float
+
+
+# ---------------------------------------------------------------------------
+# Polymarket CLOB market data
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class PriceLevel:
+    price: float
+    size: float
+
+
+@dataclass(frozen=True, slots=True)
+class PolymarketBookEvent(Event):
+    slug: str
+    asset_id: str
+    outcome: Outcome
+    bids: tuple[PriceLevel, ...]
+    asks: tuple[PriceLevel, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PolymarketPriceChangeEvent(Event):
+    slug: str
+    asset_id: str
+    outcome: Outcome
+    price: float
+    size: float
+    side: Side
+    best_bid: float | None
+    best_ask: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class PolymarketLastTradePriceEvent(Event):
+    slug: str
+    asset_id: str
+    outcome: Outcome
+    price: float
+    size: float
+    side: Side

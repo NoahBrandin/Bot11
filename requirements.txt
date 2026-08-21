@@ -1,0 +1,17 @@
+# Core async HTTP/WS clients -- Binance/Polymarket REST polling (aiohttp) and
+# streaming (websockets: Binance klines, Polymarket order book).
+aiohttp>=3.9
+websockets>=12.0
+
+# .env loading (orchestrator.py, performance_review.py).
+python-dotenv>=1.0
+
+# Polymarket's official SDK (import name `polymarket`) -- AsyncSecureClient
+# for live order placement/balances (execution/live.py), AsyncPublicClient
+# for read-only wallet queries (performance_review.py). See
+# server_src/execution/live.py's module docstring for why this SDK was
+# chosen over py_clob_client_v2.
+polymarket-client
+
+# Equity-curve/drawdown/PnL-distribution chart in performance_review.py.
+matplotlib>=3.8
