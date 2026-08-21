@@ -32,13 +32,16 @@ def build_report(
         "order_time_distribution": _order_time_distribution(filled, time_buckets),
         "order_price_distribution": _order_price_distribution(filled),
         "rejection_summary": _rejection_summary(trade_records, not_filled, time_buckets),
-        "positions_summary": _positions_summary(positions),
-        "calibration": _calibration(positions),
-        "entry_time_pnl": _entry_time_pnl(positions, time_buckets),
-        "window_participation": _window_participation(trade_records, windows),
-        "positions": positions,
+        "take_profit_analysis": _test_for_take_profit(windows, positions)
+        #"positions_summary": _positions_summary(positions),
+        #"calibration": _calibration(positions),
+        #"entry_time_pnl": _entry_time_pnl(positions, time_buckets),
+        #"window_participation": _window_participation(trade_records, windows),
+        #"positions": positions,
     }
 
+def _test_for_take_profit(windows: list[dict], positions: list[dict]):
+        print(positions)
 
 def _time_bucket_range(windows: list[dict], size: float) -> list[float]:
     if not windows:

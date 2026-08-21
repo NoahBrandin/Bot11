@@ -374,8 +374,7 @@ class StrategyLayer:
         # out of the arithmetic, no explicit exit-before-entry ordering
         # needed.
         for outcome, probability in probabilities.items():
-            logger.info(
-                f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, mu: {mu}, sigma: {sigma}")
+            #logger.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, mu: {mu}, sigma: {sigma}")
             await self._evaluate_outcome(window, outcome, probability)
 
     async def _evaluate_outcome(self, window: _ActiveWindow, outcome: Outcome, probability: float) -> None:
