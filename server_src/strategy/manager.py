@@ -59,6 +59,18 @@ DEFAULT_HISTORY_SIZE = 100
 # binance_feed.py); a gap past a few seconds means a connection hiccup
 # (drop + reconnect, or a stalled event loop) rather than ordinary jitter.
 DEFAULT_STALE_PRICE_THRESHOLD_SECONDS = 5.0
+# How far past event.window_start this process's _on_window_open can fire
+# before treating it as a late/mid-window join rather than a boundary-
+# aligned one. In steady state, WindowTracker.run() sleeps precisely until
+# window_end and opens the next window within a fraction of a second of its
+# real start; anything past a few seconds means this window was already
+# running when the process (re)started. There's no way to know what BTC did
+# during the elapsed portion, so whatever reference_price gets captured now
+# would really be "price when we joined", not "price when the window
+# opened" -- trading the GBM model off that mismatched reference for the
+# rest of the window risks systematically wrong probabilities. Skip trading
+# that window entirely instead.
+DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # Half-width of the dead zone around p=0.5: enter an outcome once its
 # modeled probability clears 0.5 + margin, exit once it drops to 0.5 -
 # margin. This symmetric band -- not a single shared threshold -- is what
@@ -83,6 +95,11 @@ class _ActiveWindow:
     up_token_id: str
     down_token_id: str
     reference_price: Optional[float] = None
+    # True when this window was already running by the time
+    # _on_window_open fired for it (see DEFAULT_LATE_JOIN_THRESHOLD_SECONDS)
+    # -- _evaluate() refuses to emit any signal for the window while this
+    # is set, so a mid-window join never trades off a mispriced reference.
+    skip_trading: bool = False
     quotes: dict = field(default_factory=lambda: {Outcome.UP: _Quote(), Outcome.DOWN: _Quote()})
     # Decision-state only, not a truth claim about fills -- see module
     # docstring. Which side of the entry/exit band each outcome is on, and
@@ -108,6 +125,7 @@ class StrategyLayer:
         kelly_multiplier: float = DEFAULT_KELLY_MULTIPLIER,
         state_file_path: str = "",
         stale_price_threshold: float = DEFAULT_STALE_PRICE_THRESHOLD_SECONDS,
+        late_join_threshold: float = DEFAULT_LATE_JOIN_THRESHOLD_SECONDS,
         price_fallback: Callable[[str], Awaitable[Optional[float]]] = fetch_current_price,
     ) -> None:
         self._execution = execution
@@ -128,6 +146,7 @@ class StrategyLayer:
         # DEFAULT_STALE_PRICE_THRESHOLD_SECONDS.
         self._current_price_ts: Optional[float] = None
         self._stale_price_threshold = stale_price_threshold
+        self._late_join_threshold = late_join_threshold
         # Independent REST read used only when the live feed can't be
         # trusted at the exact moment a reference_price is needed --
         # injectable so the backtest engine can stub it out (no network
@@ -216,6 +235,9 @@ class StrategyLayer:
         if not recovered:
             reference_price = await self._resolve_live_reference_price()
 
+        late_by = self._clock() - event.window_start
+        skip_trading = late_by > self._late_join_threshold
+
         self._window = _ActiveWindow(
             slug=event.slug,
             condition_id=event.condition_id,
@@ -223,6 +245,7 @@ class StrategyLayer:
             up_token_id=event.up_token_id,
             down_token_id=event.down_token_id,
             reference_price=reference_price,
+            skip_trading=skip_trading,
         )
         if recovered:
             logger.info(
@@ -230,7 +253,18 @@ class StrategyLayer:
             )
         elif reference_price is not None:
             self._persist_reference_price(event.slug, reference_price)
-        logger.info("Window opened: %s (reference_price=%s)", event.slug, self._window.reference_price)
+        if skip_trading:
+            logger.warning(
+                "Window %s opened %.1fs after its real start -- joined mid-window, skipping trading for it",
+                event.slug, late_by,
+            )
+            self._monitor.error(
+                f"Window {event.slug} joined mid-window ({late_by:.1f}s after real start) -- skipping trading"
+            )
+        logger.info(
+            "Window opened: %s (reference_price=%s, skip_trading=%s)",
+            event.slug, self._window.reference_price, skip_trading,
+        )
 
     async def _resolve_live_reference_price(self) -> Optional[float]:
         """The Binance kline websocket normally updates _current_price
@@ -320,6 +354,8 @@ class StrategyLayer:
     async def _evaluate(self) -> None:
         window = self._window
         if window is None or window.reference_price is None or self._current_price is None:
+            return
+        if window.skip_trading:
             return
         if len(self._price_history) < self._history_size:
             return
