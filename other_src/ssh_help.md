@@ -1,10 +1,13 @@
-# Server-Zugriff: bot11-saopaulo
+# Server-Zugriff: bot11-stockholm
 
 Zugriff läuft über **AWS SSM Session Manager**, nicht über klassisches SSH
 (kein offener Port 22, kein Key-Pair auf dieser Instanz).
 
-Instance-ID: `i-03228290c9235f478`
-Region: `sa-east-1`
+Instance-ID: `i-01525e1273b47cb1f`
+Region: `eu-north-1`
+
+Vorherige Instanz `bot11-saopaulo` (sa-east-1) wurde terminiert: Polymarket
+blockt Brasilien (siehe geoblock-Doku), alle Live-Orders schlugen fehl.
 
 ## AWS-Login (falls Session abgelaufen ist)
 
@@ -16,7 +19,7 @@ aws sts get-caller-identity   # prüft ob eingeloggt
 ## Interaktive Session öffnen
 
 ```
-aws ssm start-session --region sa-east-1 --target i-03228290c9235f478
+aws ssm start-session --region eu-north-1 --target i-01525e1273b47cb1f
 ```
 Beenden mit `exit` oder `Strg+D`.
 
@@ -55,11 +58,11 @@ sudo systemctl restart bot11
 ## Einzelbefehl ohne interaktive Session (von deinem PC aus)
 
 ```
-aws ssm send-command --region sa-east-1 --instance-ids i-03228290c9235f478 \
+aws ssm send-command --region eu-north-1 --instance-ids i-01525e1273b47cb1f \
   --document-name "AWS-RunShellScript" \
   --parameters 'commands=["systemctl status bot11 --no-pager"]'
 ```
 Liefert eine `CommandId`, Ergebnis danach abrufen mit:
 ```
-aws ssm get-command-invocation --region sa-east-1 --command-id <ID> --instance-id i-03228290c9235f478
+aws ssm get-command-invocation --region eu-north-1 --command-id <ID> --instance-id i-01525e1273b47cb1f
 ```
