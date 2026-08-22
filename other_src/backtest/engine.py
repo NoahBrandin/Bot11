@@ -40,15 +40,19 @@ from .latency_execution import LatencyModelingPaperExecutionLayer
 logger = logging.getLogger(__name__)
 
 # Polymarket's prices-history endpoint gives one traded price per point, not
-# separate bid/ask -- approximate the spread around each traded price. The
-# original 0.005 (1-cent total spread) was measured against a shallow,
-# actively-traded book; it understates the real spread away from that
-# condition -- e.g. thinner windows, or the extremes near window close where
-# the GBM model's own probability is most confident and real liquidity is
-# often worse, not better. Widened 4x by default as a more conservative
-# assumption; still a flat approximation, not a modeled function of
-# liquidity or time-to-expiry.
-DEFAULT_SPREAD_HALF_WIDTH = 0.02
+# separate bid/ask -- approximate the spread around each traded price. Sampled
+# the real live order book directly (best_bid/best_ask, not just Telegram's
+# fill-price notifications, which don't carry spread at all) across ~4 live
+# 5-minute windows: 310 samples, spread flat at $0.01 98.4% of the time
+# (median/mean both ~$0.01), with one $0.09 outlier mid-window on a thin
+# book. 0.005 half-width (the $0.01 typical case) is the realistic default;
+# a previous guess here widened it 4x to 0.02 on the theory that real spread
+# away from a shallow book is usually worse, but the actual sample doesn't
+# support that being the *typical* case -- it's the rare tail. Still a flat
+# approximation, not a modeled function of liquidity or time-to-expiry, so it
+# won't reproduce that tail (see other_src/backtest_data notes if this
+# matters for a specific analysis).
+DEFAULT_SPREAD_HALF_WIDTH = 0.005
 MIN_PRICE = 0.01
 MAX_PRICE = 0.99
 
