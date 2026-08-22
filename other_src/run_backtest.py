@@ -19,7 +19,7 @@ from backtest.engine import (
 )
 from execution.live import DEFAULT_PRICE_PROTECTION_TOLERANCE
 
-DEFAULT_OUTPUT_PATH = "backtest_data_1d.json"
+DEFAULT_OUTPUT_PATH = "data/backtest_data_1d.json"
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
