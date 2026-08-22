@@ -29,7 +29,6 @@ import asyncio
 import json
 import logging
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -48,7 +47,7 @@ from execution.base import ExecutionLayer
 from monitoring import Monitor, monitor
 
 from .binance_history import fetch_current_price, fetch_recent_closes
-from .gbm import estimate_params, probability_up
+from .gbm import GBMEstimator, probability_up
 from .kelly import DEFAULT_KELLY_MULTIPLIER, kelly_fraction
 from .orders import Signal
 
@@ -82,6 +81,23 @@ DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # tick-to-tick noise; this default needs empirical tuning (e.g. a paper-mode
 # observation run) before being trusted live.
 DEFAULT_PROBABILITY_MARGIN = 0.02
+# Switches the GBMEstimator from a flat rolling-window mean/stdev to
+# recency-weighted EWMA mode -- see gbm.py. 30s picked from a 5-day backtest
+# comparison (2026-08-22, other_src/run_backtest.py --ewma-halflife-seconds):
+# 30/60/120s all beat the flat-window baseline on 1-minute data (+12-22% more
+# realized P&L, similar ROI%), with 30s the best of the three. None disables
+# EWMA entirely, back to the original flat-window estimate_params behavior.
+# Expressed in seconds (not samples) so it stays meaningful independent of
+# binance_interval/history resolution; converted to samples via
+# _interval_seconds(binance_interval) once at construction (see
+# StrategyLayer.__init__).
+DEFAULT_EWMA_HALFLIFE_SECONDS: Optional[float] = 30.0
+
+_INTERVAL_SECONDS = {"1s": 1.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
+
+
+def _interval_seconds(interval: str) -> float:
+    return _INTERVAL_SECONDS[interval]
 
 
 @dataclass(slots=True)
@@ -130,6 +146,7 @@ class StrategyLayer:
         stale_price_threshold: float = DEFAULT_STALE_PRICE_THRESHOLD_SECONDS,
         late_join_threshold: float = DEFAULT_LATE_JOIN_THRESHOLD_SECONDS,
         price_fallback: Callable[[str], Awaitable[Optional[float]]] = fetch_current_price,
+        ewma_halflife_seconds: Optional[float] = DEFAULT_EWMA_HALFLIFE_SECONDS,
     ) -> None:
         self._execution = execution
         self._monitor = monitor or Monitor()
@@ -140,7 +157,13 @@ class StrategyLayer:
         self._history_size = history_size
         self._binance_symbol = binance_symbol
         self._binance_interval = binance_interval
-        self._price_history: deque = deque(maxlen=history_size)
+        self._ewma_halflife_seconds = ewma_halflife_seconds
+        halflife_samples = (
+            ewma_halflife_seconds / _interval_seconds(binance_interval)
+            if ewma_halflife_seconds is not None
+            else None
+        )
+        self._gbm = GBMEstimator(history_size, halflife_samples)
         self._current_price: Optional[float] = None
         # Wall-clock (well, self._clock()) time self._current_price was last
         # set -- lets _resolve_live_reference_price tell a live, just-ticked
@@ -184,7 +207,7 @@ class StrategyLayer:
         """Pre-fills the rolling price history without the live Binance
         bootstrap fetch -- used by the backtest engine, which already has
         historical closes loaded from its downloaded data file."""
-        self._price_history.extend(closes)
+        self._gbm.seed(closes)
 
     def status_text(self) -> str:
         """Human-readable snapshot for on-demand reporting (e.g. Telegram
@@ -200,7 +223,7 @@ class StrategyLayer:
         closes = await fetch_recent_closes(
             symbol=self._binance_symbol, interval=self._binance_interval, count=self._history_size
         )
-        self._price_history.extend(closes)
+        self._gbm.seed(closes)
         logger.info("Bootstrapped %d minutes of BTC price history", len(closes))
         self._monitor.info(f"Bootstrapped {len(closes)} minutes of BTC price history")
 
@@ -302,7 +325,7 @@ class StrategyLayer:
         self._current_price = event.close
         self._current_price_ts = self._clock()
         if event.is_closed:
-            self._price_history.append(event.close)
+            self._gbm.add_close(event.close)
         if self._window is not None and self._window.reference_price is None:
             self._window.reference_price = event.close
             self._persist_reference_price(self._window.slug, event.close)
@@ -378,14 +401,14 @@ class StrategyLayer:
             return
         if window.skip_trading:
             return
-        if len(self._price_history) < self._history_size:
+        if not self._gbm.ready:
             return
 
         minutes_remaining = (window.window_end - self._clock()) / 60.0
         if minutes_remaining <= 0:
             return
 
-        mu, sigma = estimate_params(tuple(self._price_history))
+        mu, sigma = self._gbm.mu, self._gbm.sigma
         p_up = probability_up(self._current_price, window.reference_price, minutes_remaining, mu, sigma)
         probabilities = {Outcome.UP: p_up, Outcome.DOWN: 1.0 - p_up}
 
@@ -395,7 +418,8 @@ class StrategyLayer:
         # out of the arithmetic, no explicit exit-before-entry ordering
         # needed.
         for outcome, probability in probabilities.items():
-            self._monitor.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, mu: {mu}, sigma: {sigma}")
+            self._monitor.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, "
+                               f"btc_price:{self._current_price}, target_price:{window.reference_price} mu: {mu}, sigma: {sigma}")
             logger.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, mu: {mu}, sigma: {sigma}")
             await self._evaluate_outcome(window, outcome, probability)
 

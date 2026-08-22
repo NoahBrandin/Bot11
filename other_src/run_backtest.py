@@ -18,8 +18,14 @@ from backtest.engine import (
     run_backtest,
 )
 from execution.live import DEFAULT_PRICE_PROTECTION_TOLERANCE
+from strategy.manager import DEFAULT_EWMA_HALFLIFE_SECONDS
 
 DEFAULT_OUTPUT_PATH = "data/backtest_data_1d.json"
+
+
+def _optional_float(value: str) -> float | None:
+    return None if value.strip().lower() == "none" else float(value)
+
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -65,6 +71,12 @@ def main() -> None:
         "--time-bucket-seconds", type=float, default=DEFAULT_TIME_BUCKET_SECONDS,
         help="Trade log/analysis only: groups time-into-window into buckets of this many seconds",
     )
+    parser.add_argument(
+        "--ewma-halflife-seconds", type=_optional_float, default=DEFAULT_EWMA_HALFLIFE_SECONDS,
+        help="Switch the GBM estimator from a flat rolling-window mean/stdev to an exponentially "
+             "weighted one with this halflife (in seconds, converted to samples internally) -- "
+             "pass 'none' to use the flat-window estimator instead",
+    )
     args = parser.parse_args()
 
     asyncio.run(
@@ -79,6 +91,7 @@ def main() -> None:
             analysis_output=args.analysis_output,
             price_bucket_size=args.price_bucket_size,
             time_bucket_seconds=args.time_bucket_seconds,
+            ewma_halflife_seconds=args.ewma_halflife_seconds,
         )
     )
 

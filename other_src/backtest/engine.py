@@ -81,6 +81,7 @@ async def run_backtest(
     analysis_output: str | None = None,
     price_bucket_size: float = DEFAULT_PRICE_BUCKET_SIZE,
     time_bucket_seconds: float = DEFAULT_TIME_BUCKET_SECONDS,
+    ewma_halflife_seconds: float | None = None,
 ) -> None:
     with open(data_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -128,7 +129,12 @@ async def run_backtest(
     async def _no_network_price_fallback(symbol: str) -> None:
         return None
 
-    strategy = StrategyLayer(execution=execution, clock=clock, price_fallback=_no_network_price_fallback)
+    strategy = StrategyLayer(
+        execution=execution,
+        clock=clock,
+        price_fallback=_no_network_price_fallback,
+        ewma_halflife_seconds=ewma_halflife_seconds,
+    )
 
     # Per-trade log: wraps converge() (the one chokepoint every order attempt
     # passes through, live or backtest) to record each attempt's decision
@@ -299,6 +305,7 @@ async def run_backtest(
                 "price_bucket_size": price_bucket_size,
                 "time_bucket_seconds": time_bucket_seconds,
                 "taker_fee_rate": taker_fee_rate,
+                "ewma_halflife_seconds": ewma_halflife_seconds,
             },
             "execution_summary": execution_summary,
         }

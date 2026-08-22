@@ -64,7 +64,7 @@ from json_logging import JsonLinesFormatter
 from monitoring import Monitor, MonitorCategory
 from strategy import StrategyLayer
 from strategy.kelly import DEFAULT_KELLY_MULTIPLIER
-from strategy.manager import DEFAULT_HISTORY_SIZE, DEFAULT_PROBABILITY_MARGIN
+from strategy.manager import DEFAULT_EWMA_HALFLIFE_SECONDS, DEFAULT_HISTORY_SIZE, DEFAULT_PROBABILITY_MARGIN
 
 logger = logging.getLogger("orchestrator")
 
@@ -98,6 +98,7 @@ class Config:
     strategy_history_size: int
     strategy_probability_margin: float
     strategy_kelly_multiplier: float
+    strategy_ewma_halflife_seconds: Optional[float]
     strategy_state_file_path: str
     execution_retry_cooldown_seconds: float
     execution_rejection_alert_threshold: int
@@ -139,6 +140,9 @@ def load_config() -> Config:
             "STRATEGY_PROBABILITY_MARGIN", DEFAULT_PROBABILITY_MARGIN
         ),
         strategy_kelly_multiplier=env_config.env_float("STRATEGY_KELLY_MULTIPLIER", DEFAULT_KELLY_MULTIPLIER),
+        strategy_ewma_halflife_seconds=env_config.env_optional_float(
+            "STRATEGY_EWMA_HALFLIFE_SECONDS", DEFAULT_EWMA_HALFLIFE_SECONDS
+        ),
         strategy_state_file_path=env_config.env_str(
             "STRATEGY_STATE_FILE_PATH",
             os.path.join(os.environ.get("LOGS_DIRECTORY", "."), "strategy_state.json"),
@@ -193,6 +197,7 @@ def _build_strategy_layer(config: Config, execution: ExecutionLayer, monitor: Mo
         monitor=monitor,
         probability_margin=config.strategy_probability_margin,
         kelly_multiplier=config.strategy_kelly_multiplier,
+        ewma_halflife_seconds=config.strategy_ewma_halflife_seconds,
         state_file_path=config.strategy_state_file_path,
     )
 
