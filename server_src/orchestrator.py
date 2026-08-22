@@ -15,7 +15,11 @@ orchestrator has both execution/strategy (for /status) and the running task
 list (for /stop). /stop sets an asyncio.Event that's raced against the other
 tasks via asyncio.wait(..., FIRST_COMPLETED), so a stop request shuts things
 down through the exact same cancel + log_stats() path a crash or Ctrl+C
-would.
+would. In live mode, /status builds a current-run performance report (win
+rate, realized P&L, direction accuracy -- see execution/live_report.py)
+straight from the wallet's on-chain history via Polymarket's public Data
+API, scoped to this process's start time (session_start below); paper mode
+has no such history, so it keeps the plain strategy/execution summary.
 
 Every behavioral tunable across all layers is resolved to a single Config
 here, once, from .env -- see load_config() -- rather than each layer reading
@@ -29,6 +33,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
@@ -48,6 +53,7 @@ from execution.base import (
     DEFAULT_RETRY_COOLDOWN_SECONDS,
 )
 from execution.live import DEFAULT_BANKROLL_CACHE_SECONDS, DEFAULT_PRICE_PROTECTION_TOLERANCE
+from execution.live_report import build_status_report, resolve_wallet_address
 from execution.paper import (
     DEFAULT_SETTLEMENT_MAX_WAIT_SECONDS,
     DEFAULT_SETTLEMENT_POLL_DELAY_SECONDS,
@@ -226,10 +232,33 @@ def route_result(result: ExecutionResult) -> None:
 
 
 def _register_commands(
-    monitor: Monitor, strategy: StrategyLayer, execution: ExecutionLayer, stop_event: asyncio.Event
+    monitor: Monitor,
+    strategy: StrategyLayer,
+    execution: ExecutionLayer,
+    stop_event: asyncio.Event,
+    session_start: datetime,
 ) -> None:
     async def handle_status() -> str:
-        return f"{strategy.status_text()}\n\n{await execution.status_text()}"
+        basic_status = f"{strategy.status_text()}\n\n{await execution.status_text()}"
+        if not isinstance(execution, LiveExecutionLayer):
+            # Paper mode has no on-chain wallet history to build a
+            # performance report from -- PaperExecutionLayer only tracks
+            # aggregate counters, not per-position win/loss -- so it keeps
+            # the plain strategy/execution summary.
+            return basic_status
+
+        address = resolve_wallet_address()
+        if not address:
+            return basic_status
+
+        try:
+            from polymarket import AsyncPublicClient
+
+            async with AsyncPublicClient() as client:
+                return await build_status_report(client, address, session_start)
+        except Exception as exc:
+            logger.exception("Failed to build live performance report for /status")
+            return f"{basic_status}\n\n(performance report failed: {exc})"
 
     async def handle_stop() -> str:
         # Send the confirmation *before* signaling stop: setting stop_event
@@ -270,11 +299,12 @@ async def run() -> None:
     config = load_config()
     monitor = Monitor.from_env()
     stop_event = asyncio.Event()
+    session_start = datetime.now(timezone.utc)
 
     datastream = _build_datastream_layer(config, monitor)
     execution = _build_execution_layer(config, monitor)
     strategy = _build_strategy_layer(config, execution, monitor)
-    _register_commands(monitor, strategy, execution, stop_event)
+    _register_commands(monitor, strategy, execution, stop_event, session_start)
 
     mode_label = "LIVE (real money)" if isinstance(execution, LiveExecutionLayer) else "paper"
     logger.info("Orchestrator started (execution_mode=%s)", mode_label)
