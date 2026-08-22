@@ -11,15 +11,17 @@ on (`wants_position`) and, while wanting a position, the target fraction and
 execution price frozen at the moment it decided to enter. The *target*
 fraction (the Kelly-derived conviction) stays frozen for as long as the
 position is wanted, so a fluctuating probability estimate can't turn into
-continuous resizing -- but the *price* tracks the live ask every tick (as
-long as it still clears entry-line edge) instead of staying frozen forever,
-since Strategy can't tell whether an earlier attempt at the old price
-actually filled (that's Execution's truth, not Strategy's -- see above), and
-resubmitting a stale price once the market has moved on has no chance of
-matching. Converge() is idempotent, so re-emitting the same Signal on every
-tick (rather than only on a state change) is cheap and safe, and is what
-lets a too-small or rejected attempt keep retrying without Strategy needing
-to know whether it actually filled.
+continuous resizing -- but the *price* tracks the live ask on every
+_evaluate() (as long as it still clears entry-line edge) instead of staying
+frozen forever, since Strategy can't tell whether an earlier attempt at the
+old price actually filled (that's Execution's truth, not Strategy's -- see
+above), and resubmitting a stale price once the market has moved on has no
+chance of matching. Converge() is idempotent, so re-emitting the same
+Signal on every _evaluate() (rather than only on a state change) is cheap
+and safe, and is what lets a too-small or rejected attempt keep retrying
+without Strategy needing to know whether it actually filled. _evaluate()
+itself only runs once per Binance candle close, not on every Polymarket
+book/price_change tick -- see _on_price_change's comment for why.
 """
 from __future__ import annotations
 
@@ -55,10 +57,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_HISTORY_SIZE = 100
 # How old self._current_price is allowed to be, at the moment a window opens
 # and reference_price needs to be captured, before it's treated as stale
-# rather than live. The kline websocket normally pushes at ~1/sec (see
-# binance_feed.py); a gap past a few seconds means a connection hiccup
-# (drop + reconnect, or a stalled event loop) rather than ordinary jitter.
-DEFAULT_STALE_PRICE_THRESHOLD_SECONDS = 5.0
+# rather than live. The kline websocket now only pushes on candle close (see
+# binance_feed.py), i.e. once per minute for the "1m" interval, so a gap past
+# one interval plus a buffer means a connection hiccup (drop + reconnect, or
+# a stalled event loop) rather than ordinary jitter.
+DEFAULT_STALE_PRICE_THRESHOLD_SECONDS = 65.0
 # How far past event.window_start this process's _on_window_open can fire
 # before treating it as a late/mid-window join rather than a boundary-
 # aligned one. In steady state, WindowTracker.run() sleeps precisely until
@@ -267,9 +270,9 @@ class StrategyLayer:
         )
 
     async def _resolve_live_reference_price(self) -> Optional[float]:
-        """The Binance kline websocket normally updates _current_price
-        about once a second (see binance_feed.py), so a fresh value is
-        exactly what a live listener would see at window open. If it's
+        """The Binance kline websocket updates _current_price once a minute,
+        on candle close (see binance_feed.py), so a fresh value is exactly
+        what a live listener would see at window open. If it's
         missing or older than _stale_price_threshold -- a dropped/
         reconnecting websocket, or a startup race -- that value can't be
         trusted, so fetch one independent REST price instead of silently
@@ -331,18 +334,36 @@ class StrategyLayer:
             logger.warning("Failed to persist reference_price for %s", slug)
 
     async def _on_book(self, event: PolymarketBookEvent) -> None:
+        # No _evaluate() call here -- see _on_price_change's comment.
         if self._window is None or event.slug != self._window.slug:
             return
         best_bid = max((level.price for level in event.bids), default=None)
         best_ask = min((level.price for level in event.asks), default=None)
         self._update_quote(event.outcome, best_bid, best_ask)
-        await self._evaluate()
 
     async def _on_price_change(self, event: PolymarketPriceChangeEvent) -> None:
+        # Quote-only: keeps window.quotes fresh for whenever _evaluate() next
+        # runs, but no longer triggers _evaluate() itself. Live Polymarket
+        # book/price_change ticks arrive far more often (POLYMARKET_POLL_
+        # INTERVAL=0.3s here, so up to ~13/s across both tokens' book+
+        # price_change streams) than the backtest replay ever sees for the
+        # same wall-clock span (its price-change events come from downloaded
+        # prices-history data at ~1/min per token) -- and _current_price only
+        # actually changes once a minute, at Binance candle close (see
+        # _on_binance_kline, and binance_feed.py's is_closed filter). Letting
+        # every Polymarket tick re-run _evaluate() reran the GBM against that
+        # same frozen _current_price while minutes_remaining kept ticking
+        # down in real time, so probability_up's vol_term (sigma * sqrt(T))
+        # kept shrinking under an input that hadn't actually moved -- an
+        # amplifying feedback loop the backtest replay never exercises, since
+        # it doesn't have this Polymarket-tick-driven re-evaluation at all at
+        # anywhere near live's frequency. _evaluate() now runs once per
+        # candle close (from _on_binance_kline), matching the backtest's
+        # cadence and only ever computing probability against a genuinely
+        # fresh _current_price.
         if self._window is None or event.slug != self._window.slug:
             return
         self._update_quote(event.outcome, event.best_bid, event.best_ask)
-        await self._evaluate()
 
     def _update_quote(self, outcome: Outcome, bid: Optional[float], ask: Optional[float]) -> None:
         quote = self._window.quotes[outcome]

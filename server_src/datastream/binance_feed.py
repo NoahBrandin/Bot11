@@ -56,6 +56,12 @@ class BinanceFeed:
         k = payload.get("k")
         if k is None:
             return
+        if not k["x"]:
+            # Only emit on candle close, matching the once-per-minute
+            # resolution the backtest replays (see engine.py's
+            # _make_kline_event, always is_closed=True) -- keeps live and
+            # backtest strategies seeing the same data cadence.
+            return
 
         self._queue.put_nowait(
             BinanceKlineEvent(
