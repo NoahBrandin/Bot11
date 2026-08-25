@@ -1,4 +1,4 @@
 from .manager import StrategyLayer
-from .orders import Signal
+from .signal import Signal
 
 __all__ = ["Signal", "StrategyLayer"]

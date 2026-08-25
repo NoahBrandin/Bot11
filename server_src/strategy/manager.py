@@ -49,7 +49,7 @@ from monitoring import Monitor, monitor
 from .binance_history import fetch_current_price, fetch_recent_closes
 from .gbm import GBMEstimator, probability_up
 from .kelly import DEFAULT_KELLY_MULTIPLIER, kelly_fraction
-from .orders import Signal
+from .signal import Signal
 
 logger = logging.getLogger(__name__)
 

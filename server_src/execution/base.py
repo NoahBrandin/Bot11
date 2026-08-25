@@ -28,11 +28,24 @@ from datastream.events import Side
 from monitoring import Monitor
 
 if TYPE_CHECKING:
-    from strategy.orders import Signal
+    from strategy.signal import Signal
 
 logger = logging.getLogger(__name__)
 
 MIN_ORDER_SIZE = 5.0  # Polymarket's real minimum share size
+
+# FAK fills report filled_size rounded to ~2 decimals (e.g. a requested
+# 6.526189 legitimately settles as 6.52) -- that's a full fill, not a
+# partial one. An absolute epsilon doesn't survive that rounding, which was
+# misclassifying full fills as partial and forcing an immediate re-check:
+# converge() would then re-fetch held from Polymarket's balance-allowance
+# API before its post-fill balance update had propagated, compute a bogus
+# non-zero delta against the just-closed position, and fire a duplicate
+# order the exchange correctly rejected as "not enough balance". A relative
+# tolerance survives normal FAK rounding (observed gaps are <0.1% of
+# order.size) while still catching genuine partial fills, which are
+# typically an order of magnitude larger.
+FULL_FILL_RELATIVE_TOLERANCE = 0.01
 
 DEFAULT_RETRY_COOLDOWN_SECONDS = 1.0
 DEFAULT_REJECTION_ALERT_THRESHOLD = 5
@@ -211,7 +224,7 @@ class ExecutionLayer(ABC):
         if result.status is OrderStatus.FILLED:
             self._rejection_streak[key] = 0
             filled_size = result.filled_size if result.filled_size is not None else order.size
-            if filled_size >= order.size - 1e-6:
+            if filled_size >= order.size * (1 - FULL_FILL_RELATIVE_TOLERANCE):
                 # Only mark this target as reached on a *full* fill. FAK can
                 # fill partially -- if it did, held only partly moved toward
                 # target_shares, so leaving this unset makes the next tick

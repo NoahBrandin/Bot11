@@ -31,7 +31,7 @@ from execution.base import OrderStatus
 from execution.live import DEFAULT_PRICE_PROTECTION_TOLERANCE
 from execution.paper import DEFAULT_TAKER_FEE_RATE
 from strategy import StrategyLayer
-from strategy.orders import Signal
+from strategy.signal import Signal
 
 from . import analysis
 from .clock import SimulatedClock
