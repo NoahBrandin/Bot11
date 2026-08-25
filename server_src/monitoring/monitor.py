@@ -35,7 +35,7 @@ from .telegram import DEFAULT_LONGPOLL_TIMEOUT, TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
-CommandHandler = Callable[[], Awaitable[str]]
+CommandHandler = Callable[[str], Awaitable[str]]
 
 # Delay before retrying a failed getUpdates long-poll (distinct from the
 # poll's own timeout).
@@ -103,10 +103,20 @@ class Monitor:
             logger.exception("Failed to deliver Telegram notification")
 
     def register_command(self, name: str, handler: CommandHandler) -> None:
-        """`handler` is an async, no-arg callable returning the text to send
-        back. `name` is the command without its leading slash (e.g.
-        "status")."""
+        """`handler` is an async callable taking the raw text after the
+        command (e.g. "/notify ORDER,ERROR" -> "ORDER,ERROR"; "" if none was
+        given) and returning the text to send back. `name` is the command
+        without its leading slash (e.g. "status")."""
         self._command_handlers[name.lstrip("/").lower()] = handler
+
+    def enabled_categories(self) -> set:
+        return set(self._enabled)
+
+    def set_enabled_categories(self, categories: set) -> None:
+        """Lets a command handler (e.g. /notify) change which categories
+        reach Telegram at runtime, instead of only via the
+        TELEGRAM_ENABLED_CATEGORIES env var read once at startup."""
+        self._enabled = set(categories)
 
     async def run_command_listener(self) -> None:
         """Long-polls the commands bot for inbound messages and dispatches
@@ -163,13 +173,14 @@ class Monitor:
             logger.warning("Ignoring Telegram command from unauthorized chat_id=%s", chat_id)
             return
 
-        command = text[1:].split("@")[0].split()[0].lower()
+        head, _, args = text[1:].partition(" ")
+        command = head.split("@")[0].lower()
         handler = self._command_handlers.get(command)
         if handler is None:
             return
 
         try:
-            response = await handler()
+            response = await handler(args.strip())
         except Exception:
             logger.exception("Command handler for /%s failed", command)
             response = f"Error running /{command} -- see logs"

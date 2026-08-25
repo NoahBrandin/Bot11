@@ -7,9 +7,10 @@ every tick -- Execution alone owns bankroll/position truth and decides
 whether a real order is needed to close the gap (see execution/base.py).
 The same Monitor instance is handed to every layer at construction time, so
 which categories of message (Event/Order/Execution/Error/Info) actually
-reach Telegram is purely a .env setting -- see monitoring/monitor.py.
+reach Telegram starts from the TELEGRAM_ENABLED_CATEGORIES .env setting (see
+monitoring/monitor.py) and can be changed at runtime via /notify below.
 
-This file also registers the two Telegram commands (/status, /stop) --
+This file also registers the Telegram commands (/status, /stop, /notify) --
 that's wiring specific to here rather than Monitor itself, since only the
 orchestrator has both execution/strategy (for /status) and the running task
 list (for /stop). /stop sets an asyncio.Event that's raced against the other
@@ -243,7 +244,7 @@ def _register_commands(
     stop_event: asyncio.Event,
     session_start: datetime,
 ) -> None:
-    async def handle_status() -> str:
+    async def handle_status(args: str) -> str:
         basic_status = f"{strategy.status_text()}\n\n{await execution.status_text()}"
         if not isinstance(execution, LiveExecutionLayer):
             # Paper mode has no on-chain wallet history to build a
@@ -265,7 +266,7 @@ def _register_commands(
             logger.exception("Failed to build live performance report for /status")
             return f"{basic_status}\n\n(performance report failed: {exc})"
 
-    async def handle_stop() -> str:
+    async def handle_stop(args: str) -> str:
         # Send the confirmation *before* signaling stop: setting stop_event
         # causes run()'s finally block to cancel this very listener task,
         # which would otherwise race (and often lose to) the in-flight send
@@ -274,13 +275,53 @@ def _register_commands(
         stop_event.set()
         return ""
 
-    async def handle_pause() -> str:
+    async def handle_pause(args: str) -> str:
         strategy.pause()
         return "Paused: no new positions will be opened. Existing positions still exit/settle normally. /resume to continue."
 
-    async def handle_resume() -> str:
+    async def handle_resume(args: str) -> str:
         strategy.resume()
         return "Resumed: new positions may be opened again."
+
+    category_choices = ", ".join(c.value for c in MonitorCategory)
+
+    async def handle_notify(args: str) -> str:
+        """Changes which MonitorCategory values reach Telegram at runtime
+        (see monitoring/monitor.py's Monitor._notify), without needing to
+        edit TELEGRAM_ENABLED_CATEGORIES in .env and restart. With no args,
+        reports the currently enabled categories instead of changing them."""
+        if not args:
+            current = ", ".join(sorted(c.value for c in monitor.enabled_categories())) or "none"
+            return (
+                f"Currently enabled: {current}\n"
+                f"Usage: /notify ALL|NONE|CAT1,CAT2,... (choices: {category_choices})"
+            )
+
+        raw = args.strip().upper()
+        if raw == "NONE":
+            monitor.set_enabled_categories(set())
+            return "Notifications disabled for all categories."
+        if raw == "ALL":
+            monitor.set_enabled_categories(set(MonitorCategory))
+            return f"Notifications enabled for all categories: {category_choices}"
+
+        categories = set()
+        unknown = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                categories.add(MonitorCategory(part))
+            except ValueError:
+                unknown.append(part)
+        if unknown:
+            return f"Unknown categories: {', '.join(unknown)}. Choices: {category_choices}"
+        if not categories:
+            return "No categories given. Usage: /notify ALL|NONE|CAT1,CAT2,..."
+
+        monitor.set_enabled_categories(categories)
+        return f"Notifications enabled for: {', '.join(sorted(c.value for c in categories))}"
 
     # Description text lives alongside each handler so /help can't drift out
     # of sync with what's actually registered.
@@ -289,9 +330,10 @@ def _register_commands(
         "pause": ("Stop opening new positions (existing ones still exit/settle normally)", handle_pause),
         "resume": ("Resume opening new positions", handle_resume),
         "stop": ("Shut down the orchestrator", handle_stop),
+        "notify": (f"Set enabled Telegram categories: ALL|NONE|CAT1,CAT2,... ({category_choices})", handle_notify),
     }
 
-    async def handle_help() -> str:
+    async def handle_help(args: str) -> str:
         lines = [f"/{name} - {desc}" for name, (desc, _) in sorted(commands.items())]
         return "Available commands:\n/help - Show this message\n" + "\n".join(lines)
 
