@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
 class Side(str, Enum):
@@ -62,6 +63,13 @@ class WindowOpenEvent(Event):
     window_end: float
     up_token_id: str
     down_token_id: str
+    # The Chainlink BTC/USD price observed at (or nearest to) window_start --
+    # the actual resolution anchor for the window's Up/Down outcome (distinct
+    # from strategy/manager.py's own Binance-derived reference_price, which
+    # feeds the GBM model rather than settlement). None when no Chainlink
+    # tick had arrived yet at open time.
+    oracle_price: Optional[float] = None
+    oracle_price_timestamp: Optional[float] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,21 +85,6 @@ class WindowCloseEvent(Event):
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
-class PriceLevel:
-    price: float
-    size: float
-
-
-@dataclass(frozen=True, slots=True)
-class PolymarketBookEvent(Event):
-    slug: str
-    asset_id: str
-    outcome: Outcome
-    bids: tuple[PriceLevel, ...]
-    asks: tuple[PriceLevel, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class PolymarketPriceChangeEvent(Event):
     slug: str
     asset_id: str
@@ -103,11 +96,12 @@ class PolymarketPriceChangeEvent(Event):
     best_ask: float | None
 
 
+# ---------------------------------------------------------------------------
+# Polymarket RTDS Chainlink crypto prices
+# ---------------------------------------------------------------------------
+
 @dataclass(frozen=True, slots=True)
-class PolymarketLastTradePriceEvent(Event):
-    slug: str
-    asset_id: str
-    outcome: Outcome
-    price: float
-    size: float
-    side: Side
+class ChainlinkPriceEvent(Event):
+    symbol: str
+    value: float
+    oracle_timestamp: float

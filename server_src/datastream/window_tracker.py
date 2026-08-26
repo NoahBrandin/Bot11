@@ -15,6 +15,7 @@ from typing import Awaitable, Callable, Optional
 
 from monitoring import Monitor
 
+from .chainlink_feed import ChainlinkFeed
 from .events import WindowCloseEvent, WindowOpenEvent
 from .gamma_client import DEFAULT_WINDOW_SECONDS, GammaClient, WindowMarket
 
@@ -47,6 +48,7 @@ class WindowTracker:
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
         prefetch_lead_seconds: float = DEFAULT_PREFETCH_LEAD_SECONDS,
         fetch_retry_delay: float = DEFAULT_FETCH_RETRY_DELAY,
+        chainlink_feed: Optional[ChainlinkFeed] = None,
     ) -> None:
         self._queue = queue
         self._gamma = gamma
@@ -56,6 +58,7 @@ class WindowTracker:
         self._window_seconds = window_seconds
         self._prefetch_lead_seconds = prefetch_lead_seconds
         self._fetch_retry_delay = fetch_retry_delay
+        self._chainlink_feed = chainlink_feed
 
     async def run(self) -> None:
         market = await self._fetch_with_retry(current_window_start(window_seconds=self._window_seconds))
@@ -93,6 +96,14 @@ class WindowTracker:
         if self._on_window_open is not None:
             await self._on_window_open(market)
         self._monitor.event(f"Window opened: {market.slug}")
+
+        oracle_price = None
+        oracle_price_timestamp = None
+        if self._chainlink_feed is not None and self._chainlink_feed.last_price is not None:
+            last_price = self._chainlink_feed.last_price
+            oracle_price = last_price.value
+            oracle_price_timestamp = last_price.oracle_timestamp
+
         await self._queue.put(
             WindowOpenEvent(
                 timestamp=time.time(),
@@ -102,6 +113,8 @@ class WindowTracker:
                 window_end=market.window_end,
                 up_token_id=market.up_token_id,
                 down_token_id=market.down_token_id,
+                oracle_price=oracle_price,
+                oracle_price_timestamp=oracle_price_timestamp,
             )
         )
 

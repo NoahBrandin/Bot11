@@ -20,6 +20,8 @@ from monitoring import Monitor
 
 from .binance_feed import BinanceFeed
 from .binance_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_BINANCE_RECONNECT_DELAY
+from .chainlink_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_CHAINLINK_RECONNECT_DELAY
+from .chainlink_feed import ChainlinkFeed
 from .gamma_client import DEFAULT_WINDOW_SECONDS, GammaClient, WindowMarket
 from .polymarket_feed import (
     DEFAULT_APP_PING_INTERVAL,
@@ -42,6 +44,7 @@ class DatastreamLayer:
         binance_reconnect_delay: float = DEFAULT_BINANCE_RECONNECT_DELAY,
         polymarket_reconnect_delay: float = DEFAULT_POLYMARKET_RECONNECT_DELAY,
         polymarket_app_ping_interval: float = DEFAULT_APP_PING_INTERVAL,
+        chainlink_reconnect_delay: float = DEFAULT_CHAINLINK_RECONNECT_DELAY,
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
         prefetch_lead_seconds: float = DEFAULT_PREFETCH_LEAD_SECONDS,
         window_fetch_retry_delay: float = DEFAULT_FETCH_RETRY_DELAY,
@@ -61,6 +64,11 @@ class DatastreamLayer:
             interval=binance_interval,
             monitor=self._monitor,
             reconnect_delay=binance_reconnect_delay,
+        )
+        self._chainlink_feed = ChainlinkFeed(
+            self.queue,
+            monitor=self._monitor,
+            reconnect_delay=chainlink_reconnect_delay,
         )
         self._window_seconds = window_seconds
         self._prefetch_lead_seconds = prefetch_lead_seconds
@@ -84,10 +92,12 @@ class DatastreamLayer:
                 window_seconds=self._window_seconds,
                 prefetch_lead_seconds=self._prefetch_lead_seconds,
                 fetch_retry_delay=self._window_fetch_retry_delay,
+                chainlink_feed=self._chainlink_feed,
             )
 
             await asyncio.gather(
                 self._binance_feed.run(),
                 self._polymarket_feed.run(),
+                self._chainlink_feed.run(),
                 window_tracker.run(),
             )

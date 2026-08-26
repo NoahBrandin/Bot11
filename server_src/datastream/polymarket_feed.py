@@ -144,27 +144,8 @@ class PolymarketFeed:
                 self._handle_price_change(change, now)
             return
 
-        asset_id = msg.get("asset_id")
-        info = self._asset_outcome.get(asset_id)
-        if info is None:
-            return
-        slug, outcome = info
-
-        if event_type == "book":
-            self._handle_book(msg, slug, outcome, now)
-        elif event_type == "last_trade_price":
-            self._handle_last_trade_price(msg, slug, outcome, now)
-
-    def _handle_book(self, msg: dict, slug: str, outcome: Outcome, now: float) -> None:
-        if not self._should_emit(msg["asset_id"], "book", now):
-            return
-        bids = tuple(PriceLevel(float(b["price"]), float(b["size"])) for b in msg.get("bids", []))
-        asks = tuple(PriceLevel(float(a["price"]), float(a["size"])) for a in msg.get("asks", []))
-        self._queue.put_nowait(
-            PolymarketBookEvent(
-                timestamp=now, slug=slug, asset_id=msg["asset_id"], outcome=outcome, bids=bids, asks=asks
-            )
-        )
+        if event_type == "book" or event_type == "last_trade_price":
+            pass
 
     def _handle_price_change(self, change: dict, now: float) -> None:
         asset_id = change.get("asset_id")
@@ -185,18 +166,5 @@ class PolymarketFeed:
                 side=Side(change["side"]) if change.get("side") else Side.BUY,
                 best_bid=float(change["best_bid"]) if change.get("best_bid") is not None else None,
                 best_ask=float(change["best_ask"]) if change.get("best_ask") is not None else None,
-            )
-        )
-
-    def _handle_last_trade_price(self, msg: dict, slug: str, outcome: Outcome, now: float) -> None:
-        self._queue.put_nowait(
-            PolymarketLastTradePriceEvent(
-                timestamp=now,
-                slug=slug,
-                asset_id=msg["asset_id"],
-                outcome=outcome,
-                price=float(msg["price"]),
-                size=float(msg.get("size", 0.0)),
-                side=Side(msg["side"]) if msg.get("side") else Side.BUY,
             )
         )
