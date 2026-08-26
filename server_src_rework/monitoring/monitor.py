@@ -29,7 +29,7 @@ import os
 from enum import Enum
 from typing import Awaitable, Callable, Optional
 
-import env_config
+from utils import env_config
 
 from .telegram import DEFAULT_LONGPOLL_TIMEOUT, TelegramNotifier
 
