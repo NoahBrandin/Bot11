@@ -18,10 +18,7 @@ from monitoring import Monitor
 
 from .events import (
     Outcome,
-    PolymarketBookEvent,
-    PolymarketLastTradePriceEvent,
     PolymarketPriceChangeEvent,
-    PriceLevel,
     Side,
 )
 

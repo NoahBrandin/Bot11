@@ -15,7 +15,7 @@ from typing import Awaitable, Callable, Optional
 
 from monitoring import Monitor
 
-from .chainlink_feed import ChainlinkFeed
+from .binance_feed import BinanceFeed
 from .events import WindowCloseEvent, WindowOpenEvent
 from .gamma_client import DEFAULT_WINDOW_SECONDS, GammaClient, WindowMarket
 
@@ -48,7 +48,7 @@ class WindowTracker:
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
         prefetch_lead_seconds: float = DEFAULT_PREFETCH_LEAD_SECONDS,
         fetch_retry_delay: float = DEFAULT_FETCH_RETRY_DELAY,
-        chainlink_feed: Optional[ChainlinkFeed] = None,
+        binance_feed: Optional[BinanceFeed] = None,
     ) -> None:
         self._queue = queue
         self._gamma = gamma
@@ -58,7 +58,7 @@ class WindowTracker:
         self._window_seconds = window_seconds
         self._prefetch_lead_seconds = prefetch_lead_seconds
         self._fetch_retry_delay = fetch_retry_delay
-        self._chainlink_feed = chainlink_feed
+        self._binance_feed = binance_feed
 
     async def run(self) -> None:
         market = await self._fetch_with_retry(current_window_start(window_seconds=self._window_seconds))
@@ -93,16 +93,27 @@ class WindowTracker:
             await asyncio.sleep(self._fetch_retry_delay)
 
     async def _open(self, market: WindowMarket) -> None:
+        # Always emits WindowOpenEvent immediately -- on_window_open (the
+        # Polymarket subscribe) and the event itself must never be delayed
+        # waiting on target_price. last_closed is a plain in-memory read, so
+        # this never blocks; if the window's own Binance candle-close hasn't
+        # arrived over the network yet (or never arrives), target_price just
+        # comes through as None rather than holding anything up.
         if self._on_window_open is not None:
             await self._on_window_open(market)
         self._monitor.event(f"Window opened: {market.slug}")
 
-        oracle_price = None
-        oracle_price_timestamp = None
-        if self._chainlink_feed is not None and self._chainlink_feed.last_price is not None:
-            last_price = self._chainlink_feed.last_price
-            oracle_price = last_price.value
-            oracle_price_timestamp = last_price.oracle_timestamp
+        target_price = None
+        target_price_timestamp = None
+        last_closed = self._binance_feed.last_closed if self._binance_feed is not None else None
+        if last_closed is not None and last_closed.kline_close_time >= market.window_start:
+            # < window_start means this window's own candle-close hasn't
+            # arrived yet (a race, not a crash) -- last_closed is still the
+            # *previous* window's price, so using it would silently mislabel
+            # a stale value as this window's target_price. Leave it None
+            # instead; the event still goes out on time either way.
+            target_price = last_closed.close
+            target_price_timestamp = last_closed.kline_close_time
 
         await self._queue.put(
             WindowOpenEvent(
@@ -113,8 +124,8 @@ class WindowTracker:
                 window_end=market.window_end,
                 up_token_id=market.up_token_id,
                 down_token_id=market.down_token_id,
-                oracle_price=oracle_price,
-                oracle_price_timestamp=oracle_price_timestamp,
+                target_price=target_price,
+                target_price_timestamp=target_price_timestamp,
             )
         )
 

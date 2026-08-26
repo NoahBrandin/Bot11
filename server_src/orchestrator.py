@@ -40,7 +40,6 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-import env_config
 from datastream import DatastreamLayer
 from datastream.binance_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_BINANCE_RECONNECT_DELAY
 from datastream.gamma_client import DEFAULT_WINDOW_SECONDS
@@ -61,11 +60,12 @@ from execution.paper import (
     DEFAULT_STARTING_BANKROLL,
     DEFAULT_TAKER_FEE_RATE,
 )
-from json_logging import JsonLinesFormatter
+from utils.json_logging import JsonLinesFormatter
 from monitoring import Monitor, MonitorCategory
 from strategy import StrategyLayer
-from strategy.kelly import DEFAULT_KELLY_MULTIPLIER
+from strategy.utils.kelly import DEFAULT_KELLY_MULTIPLIER
 from strategy.manager import DEFAULT_EWMA_HALFLIFE_SECONDS, DEFAULT_HISTORY_SIZE, DEFAULT_PROBABILITY_MARGIN
+from utils import env_config
 
 logger = logging.getLogger("orchestrator")
 

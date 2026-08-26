@@ -36,6 +36,7 @@ class BinanceFeed:
         self._url = f"{BASE_WS_URL}/{symbol.lower()}@kline_{interval}"
         self._monitor = monitor or Monitor()
         self._reconnect_delay = reconnect_delay
+        self.last_closed: Optional[BinanceKlineEvent] = None
 
     async def run(self) -> None:
         while True:
@@ -56,25 +57,24 @@ class BinanceFeed:
         k = payload.get("k")
         if k is None:
             return
-        if not k["x"]:
-            # Only emit on candle close, matching the once-per-minute
-            # resolution the backtest replays (see engine.py's
-            # _make_kline_event, always is_closed=True) -- keeps live and
-            # backtest strategies seeing the same data cadence.
-            return
 
-        self._queue.put_nowait(
-            BinanceKlineEvent(
-                timestamp=time.time(),
-                symbol=k["s"],
-                interval=k["i"],
-                kline_open_time=k["t"] / 1000,
-                kline_close_time=k["T"] / 1000,
-                open=float(k["o"]),
-                high=float(k["h"]),
-                low=float(k["l"]),
-                close=float(k["c"]),
-                volume=float(k["v"]),
-                is_closed=bool(k["x"]),
-            )
+        # Emits on every kline update, not just candle close -- is_closed
+        # tells consumers which is which, so anything wanting the old
+        # once-per-candle cadence (e.g. matching engine.py's backtest
+        # replay, which only ever produces is_closed=True) can filter on it.
+        event = BinanceKlineEvent(
+            timestamp=time.time(),
+            symbol=k["s"],
+            interval=k["i"],
+            kline_open_time=k["t"] / 1000,
+            kline_close_time=k["T"] / 1000,
+            open=float(k["o"]),
+            high=float(k["h"]),
+            low=float(k["l"]),
+            close=float(k["c"]),
+            volume=float(k["v"]),
+            is_closed=bool(k["x"]),
         )
+        if event.is_closed:
+            self.last_closed = event
+        self._queue.put_nowait(event)

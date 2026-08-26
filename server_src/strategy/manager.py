@@ -21,7 +21,19 @@ Signal on every _evaluate() (rather than only on a state change) is cheap
 and safe, and is what lets a too-small or rejected attempt keep retrying
 without Strategy needing to know whether it actually filled. _evaluate()
 itself only runs once per Binance candle close, not on every Polymarket
-book/price_change tick -- see _on_price_change's comment for why.
+price_change tick -- see _on_price_change's comment for why.
+
+Reference-price capture (the BTC price a window's outcome is judged against)
+now happens in the Datastream-Layer: WindowOpenEvent.target_price is set from
+WindowTracker's own view of BinanceFeed.last_closed at the moment the window
+opens (see datastream/window_tracker.py::_open). Strategy just consumes it --
+the REST-fallback/staleness-threshold machinery that used to live here is
+gone. What's still Strategy's job: if target_price arrives None (the
+window's own candle-close raced window-open), capture one late from the
+first kline that closes after open (_on_binance_kline) -- and if the whole
+process restarts mid-window, recognize that a freshly (re)connected
+BinanceFeed's next kline won't reflect the window's true start price either,
+via skip_trading/DEFAULT_LATE_JOIN_THRESHOLD_SECONDS below.
 """
 from __future__ import annotations
 
@@ -31,47 +43,39 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Callable, Optional
 
 from datastream.events import (
     BinanceKlineEvent,
     Event,
     Outcome,
-    PolymarketBookEvent,
-    PolymarketLastTradePriceEvent,
     PolymarketPriceChangeEvent,
     WindowCloseEvent,
     WindowOpenEvent,
 )
 from execution.base import ExecutionLayer
-from monitoring import Monitor, monitor
+from monitoring import Monitor
 
-from .binance_history import fetch_current_price, fetch_recent_closes
-from .gbm import GBMEstimator, probability_up
-from .kelly import DEFAULT_KELLY_MULTIPLIER, kelly_fraction
+from strategy.utils.binance_history import fetch_recent_closes
+from strategy.utils.gbm import GBMEstimator, probability_up
+from strategy.utils.kelly import DEFAULT_KELLY_MULTIPLIER, kelly_fraction
 from .signal import Signal
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HISTORY_SIZE = 100
-# How old self._current_price is allowed to be, at the moment a window opens
-# and reference_price needs to be captured, before it's treated as stale
-# rather than live. The kline websocket now only pushes on candle close (see
-# binance_feed.py), i.e. once per minute for the "1m" interval, so a gap past
-# one interval plus a buffer means a connection hiccup (drop + reconnect, or
-# a stalled event loop) rather than ordinary jitter.
-DEFAULT_STALE_PRICE_THRESHOLD_SECONDS = 65.0
 # How far past event.window_start this process's _on_window_open can fire
 # before treating it as a late/mid-window join rather than a boundary-
 # aligned one. In steady state, WindowTracker.run() sleeps precisely until
 # window_end and opens the next window within a fraction of a second of its
 # real start; anything past a few seconds means this window was already
-# running when the process (re)started. There's no way to know what BTC did
-# during the elapsed portion, so whatever reference_price gets captured now
-# would really be "price when we joined", not "price when the window
-# opened" -- trading the GBM model off that mismatched reference for the
-# rest of the window risks systematically wrong probabilities. Skip trading
-# that window entirely instead.
+# running when the process (re)started. A restart also means BinanceFeed's
+# last_closed is gone -- the datastream layer has no better a reference
+# price to offer than we do -- so whatever gets captured (from the event's
+# target_price, persisted state, or the next kline) really is "price when we
+# joined", not "price when the window opened". Trading the GBM model off
+# that mismatched reference for the rest of the window risks systematically
+# wrong probabilities. Skip trading that window entirely instead.
 DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # Half-width of the dead zone around p=0.5: enter an outcome once its
 # modeled probability clears 0.5 + margin, exit once it drops to 0.5 -
@@ -92,6 +96,8 @@ DEFAULT_PROBABILITY_MARGIN = 0.02
 # _interval_seconds(binance_interval) once at construction (see
 # StrategyLayer.__init__).
 DEFAULT_EWMA_HALFLIFE_SECONDS: Optional[float] = 30.0
+# Disabled by default -- see StrategyLayer._state_file_path.
+DEFAULT_STATE_FILE_PATH = ""
 
 _INTERVAL_SECONDS = {"1s": 1.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
 
@@ -113,7 +119,8 @@ class _ActiveWindow:
     window_end: float
     up_token_id: str
     down_token_id: str
-    reference_price: Optional[float] = None
+    target_price: Optional[float] = None
+    target_price_timestamp: Optional[float] = None
     # True when this window was already running by the time
     # _on_window_open fired for it (see DEFAULT_LATE_JOIN_THRESHOLD_SECONDS)
     # -- _evaluate() refuses to emit any signal for the window while this
@@ -142,10 +149,8 @@ class StrategyLayer:
         clock: Callable[[], float] = time.time,
         probability_margin: float = DEFAULT_PROBABILITY_MARGIN,
         kelly_multiplier: float = DEFAULT_KELLY_MULTIPLIER,
-        state_file_path: str = "",
-        stale_price_threshold: float = DEFAULT_STALE_PRICE_THRESHOLD_SECONDS,
+        state_file_path: str = DEFAULT_STATE_FILE_PATH,
         late_join_threshold: float = DEFAULT_LATE_JOIN_THRESHOLD_SECONDS,
-        price_fallback: Callable[[str], Awaitable[Optional[float]]] = fetch_current_price,
         ewma_halflife_seconds: Optional[float] = DEFAULT_EWMA_HALFLIFE_SECONDS,
     ) -> None:
         self._execution = execution
@@ -165,29 +170,18 @@ class StrategyLayer:
         )
         self._gbm = GBMEstimator(history_size, halflife_samples)
         self._current_price: Optional[float] = None
-        # Wall-clock (well, self._clock()) time self._current_price was last
-        # set -- lets _resolve_live_reference_price tell a live, just-ticked
-        # price apart from one that's sitting stale because the kline
-        # websocket dropped and hasn't reconnected yet. See
-        # DEFAULT_STALE_PRICE_THRESHOLD_SECONDS.
-        self._current_price_ts: Optional[float] = None
-        self._stale_price_threshold = stale_price_threshold
         self._late_join_threshold = late_join_threshold
-        # Independent REST read used only when the live feed can't be
-        # trusted at the exact moment a reference_price is needed --
-        # injectable so the backtest engine can stub it out (no network
-        # calls in an offline, deterministic replay), same pattern as
-        # execution.on_window_close there. See _resolve_live_reference_price.
-        self._price_fallback = price_fallback
         self._window: Optional[_ActiveWindow] = None
         # Where the currently-open window's (slug, reference_price) is
         # persisted -- see _load_persisted_reference_price/_persist_
         # reference_price. Empty disables persistence entirely (the
         # backtest engine never passes a path, so it can never read/write
         # real live-run state). A restart mid-window otherwise has no
-        # memory of the reference_price captured before it died, and would
-        # silently re-capture a later (and therefore wrong) one from
-        # whatever Binance kline arrives next -- see module history.
+        # memory of the reference_price WindowOpenEvent carried before it
+        # died, and a freshly (re)started datastream layer can't recover it
+        # either (see DEFAULT_LATE_JOIN_THRESHOLD_SECONDS) -- so without
+        # persistence a restart would silently re-capture a later (and
+        # therefore wrong) price from whatever Binance kline arrives next.
         self._state_file_path = Path(state_file_path) if state_file_path else None
         # While paused, _evaluate_outcome still runs every tick (so exits,
         # settlement, and status reporting are all unaffected) -- it just
@@ -196,28 +190,6 @@ class StrategyLayer:
         # flattened, since an automatic forced exit is a bigger, riskier
         # action than a human on the other end of /pause is likely expecting.
         self._paused = False
-
-    def pause(self) -> None:
-        self._paused = True
-
-    def resume(self) -> None:
-        self._paused = False
-
-    def seed_history(self, closes: list[float]) -> None:
-        """Pre-fills the rolling price history without the live Binance
-        bootstrap fetch -- used by the backtest engine, which already has
-        historical closes loaded from its downloaded data file."""
-        self._gbm.seed(closes)
-
-    def status_text(self) -> str:
-        """Human-readable snapshot for on-demand reporting (e.g. Telegram
-        /status). Position/bankroll reporting lives on the Execution side
-        now -- see execution/base.py::status_text -- since that's the only
-        place real holdings are known."""
-        if self._window is None:
-            return f"Strategy: no active window yet (paused={self._paused})"
-        w = self._window
-        return f"Strategy:\nwindow={w.slug} current_price={self._current_price} paused={self._paused}"
 
     async def run(self, events: asyncio.Queue) -> None:
         closes = await fetch_recent_closes(
@@ -244,22 +216,22 @@ class StrategyLayer:
             case WindowOpenEvent():
                 await self._on_window_open(event)
             case WindowCloseEvent():
-                logger.info("Window closed: %s", event.slug)
                 await self._execution.on_window_close(event.slug)
             case BinanceKlineEvent():
                 await self._on_binance_kline(event)
-            case PolymarketBookEvent():
-                await self._on_book(event)
             case PolymarketPriceChangeEvent():
                 await self._on_price_change(event)
-            case PolymarketLastTradePriceEvent():
-                pass
 
+#   --- Event-Handling ---
     async def _on_window_open(self, event: WindowOpenEvent) -> None:
-        reference_price = self._load_persisted_reference_price(event.slug)
-        recovered = reference_price is not None
-        if not recovered:
-            reference_price = await self._resolve_live_reference_price()
+        target_price = event.target_price
+        target_price_timestamp = event.target_price_timestamp
+        recovered = False
+        if target_price is None:
+            persisted = self._load_persisted_target_price(event.slug)
+            if persisted is not None:
+                target_price, target_price_timestamp = persisted
+                recovered = True
 
         late_by = self._clock() - event.window_start
         skip_trading = late_by > self._late_join_threshold
@@ -270,134 +242,56 @@ class StrategyLayer:
             window_end=event.window_end,
             up_token_id=event.up_token_id,
             down_token_id=event.down_token_id,
-            reference_price=reference_price,
+            target_price=target_price,
+            target_price_timestamp=target_price_timestamp,
             skip_trading=skip_trading,
         )
         if recovered:
             logger.info(
-                "Window %s reference_price recovered from persisted state: %s", event.slug, reference_price
+                "Window %s target_price recovered from persisted state: %s", event.slug, target_price
             )
-        elif reference_price is not None:
-            self._persist_reference_price(event.slug, reference_price)
+            self._monitor.info(f"Window {event.slug} target_price recovered from persisted state: {target_price}")
+        elif target_price is not None:
+            self._persist_reference_price(event.slug, target_price, target_price_timestamp)
+
         if skip_trading:
             logger.warning(
                 "Window %s opened %.1fs after its real start -- joined mid-window, skipping trading for it",
                 event.slug, late_by,
             )
+            self._monitor.info(
+                f"Window {event.slug} opened {late_by:.1f}s after its real start -- joined mid-window, "
+                "skipping trading for it"
+            )
             self._monitor.error(
                 f"Window {event.slug} joined mid-window ({late_by:.1f}s after real start) -- skipping trading"
             )
         logger.info(
-            "Window opened: %s (reference_price=%s, skip_trading=%s)",
-            event.slug, self._window.reference_price, skip_trading,
+            "Window opened: %s (target_price=%s, skip_trading=%s)",
+            event.slug, target_price, skip_trading,
         )
-
-    async def _resolve_live_reference_price(self) -> Optional[float]:
-        """The Binance kline websocket updates _current_price once a minute,
-        on candle close (see binance_feed.py), so a fresh value is exactly
-        what a live listener would see at window open. If it's
-        missing or older than _stale_price_threshold -- a dropped/
-        reconnecting websocket, or a startup race -- that value can't be
-        trusted, so fetch one independent REST price instead of silently
-        locking in a reference_price that's actually minutes old (the
-        original bug: a connection hiccup around window open produced a
-        wrong reference_price for the rest of that window, since it's
-        frozen once set)."""
-        now = self._clock()
-        if (
-            self._current_price is not None
-            and self._current_price_ts is not None
-            and (now - self._current_price_ts) <= self._stale_price_threshold
-        ):
-            return self._current_price
-
-        age = None if self._current_price_ts is None else now - self._current_price_ts
-        logger.warning("Binance price stale or missing at window open (age=%s), using REST fallback", age)
-        self._monitor.error(f"Binance feed stale at window open (age={age}) -- using REST fallback for reference_price")
-        try:
-            return await self._price_fallback(self._binance_symbol)
-        except Exception:
-            logger.exception("REST fallback for reference_price failed; will capture late from next kline tick")
-            self._monitor.error("REST fallback for reference_price failed; capturing late from next kline tick")
-            return None
+        self._monitor.info(f"Window opened: {event.slug} (target_price={target_price}, skip_trading={skip_trading})")
 
     async def _on_binance_kline(self, event: BinanceKlineEvent) -> None:
         self._current_price = event.close
-        self._current_price_ts = self._clock()
+        if self._window is not None and self._window.target_price is None:
+            self._window.target_price = event.close
+            self._window.target_price_timestamp = event.kline_close_time
+            self._persist_reference_price(self._window.slug, event.close, event.kline_close_time)
+            logger.info("Window %s reference_price captured late: %s", self._window.slug, event.close)
         if event.is_closed:
             self._gbm.add_close(event.close)
-        if self._window is not None and self._window.reference_price is None:
-            self._window.reference_price = event.close
-            self._persist_reference_price(self._window.slug, event.close)
-            logger.info("Window %s reference_price captured late: %s", self._window.slug, event.close)
-        await self._evaluate()
-
-    def _load_persisted_reference_price(self, slug: str) -> Optional[float]:
-        """Recovers the reference_price captured for `slug` before a prior
-        process restart, so a window that's still open picks up exactly
-        where it left off instead of re-capturing a later (and therefore
-        wrong) price from whatever Binance kline arrives next."""
-        if self._state_file_path is None:
-            return None
-        try:
-            data = json.loads(self._state_file_path.read_text())
-        except (OSError, ValueError):
-            return None
-        if not isinstance(data, dict) or data.get("slug") != slug:
-            return None
-        price = data.get("reference_price")
-        return float(price) if price is not None else None
-
-    def _persist_reference_price(self, slug: str, reference_price: float) -> None:
-        if self._state_file_path is None:
-            return
-        try:
-            self._state_file_path.write_text(json.dumps({"slug": slug, "reference_price": reference_price}))
-        except OSError:
-            logger.warning("Failed to persist reference_price for %s", slug)
-
-    async def _on_book(self, event: PolymarketBookEvent) -> None:
-        # No _evaluate() call here -- see _on_price_change's comment.
-        if self._window is None or event.slug != self._window.slug:
-            return
-        best_bid = max((level.price for level in event.bids), default=None)
-        best_ask = min((level.price for level in event.asks), default=None)
-        self._update_quote(event.outcome, best_bid, best_ask)
+            await self._evaluate()
 
     async def _on_price_change(self, event: PolymarketPriceChangeEvent) -> None:
-        # Quote-only: keeps window.quotes fresh for whenever _evaluate() next
-        # runs, but no longer triggers _evaluate() itself. Live Polymarket
-        # book/price_change ticks arrive far more often (POLYMARKET_POLL_
-        # INTERVAL=0.3s here, so up to ~13/s across both tokens' book+
-        # price_change streams) than the backtest replay ever sees for the
-        # same wall-clock span (its price-change events come from downloaded
-        # prices-history data at ~1/min per token) -- and _current_price only
-        # actually changes once a minute, at Binance candle close (see
-        # _on_binance_kline, and binance_feed.py's is_closed filter). Letting
-        # every Polymarket tick re-run _evaluate() reran the GBM against that
-        # same frozen _current_price while minutes_remaining kept ticking
-        # down in real time, so probability_up's vol_term (sigma * sqrt(T))
-        # kept shrinking under an input that hadn't actually moved -- an
-        # amplifying feedback loop the backtest replay never exercises, since
-        # it doesn't have this Polymarket-tick-driven re-evaluation at all at
-        # anywhere near live's frequency. _evaluate() now runs once per
-        # candle close (from _on_binance_kline), matching the backtest's
-        # cadence and only ever computing probability against a genuinely
-        # fresh _current_price.
         if self._window is None or event.slug != self._window.slug:
             return
         self._update_quote(event.outcome, event.best_bid, event.best_ask)
 
-    def _update_quote(self, outcome: Outcome, bid: Optional[float], ask: Optional[float]) -> None:
-        quote = self._window.quotes[outcome]
-        if bid is not None:
-            quote.bid = bid
-        if ask is not None:
-            quote.ask = ask
-
+#   --- Evaluation ---
     async def _evaluate(self) -> None:
         window = self._window
-        if window is None or window.reference_price is None or self._current_price is None:
+        if window is None or window.target_price is None or self._current_price is None:
             return
         if window.skip_trading:
             return
@@ -409,18 +303,14 @@ class StrategyLayer:
             return
 
         mu, sigma = self._gbm.mu, self._gbm.sigma
-        p_up = probability_up(self._current_price, window.reference_price, minutes_remaining, mu, sigma)
+        p_up = probability_up(self._current_price, window.target_price, minutes_remaining, mu, sigma)
         probabilities = {Outcome.UP: p_up, Outcome.DOWN: 1.0 - p_up}
 
-        # Independent per outcome, in either order: probabilities[UP] +
-        # probabilities[DOWN] == 1, so at most one can ever clear
-        # entry_line (> 0.5 + margin) at a time -- mutual exclusivity falls
-        # out of the arithmetic, no explicit exit-before-entry ordering
-        # needed.
         for outcome, probability in probabilities.items():
             self._monitor.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, "
-                               f"btc_price:{self._current_price}, target_price:{window.reference_price} mu: {mu}, sigma: {sigma}")
-            logger.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, mu: {mu}, sigma: {sigma}")
+                               f"btc_price:{self._current_price}, target_price:{window.target_price} mu: {mu}, sigma: {sigma}")
+            logger.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, "
+                               f"btc_price:{self._current_price}, target_price:{window.target_price} mu: {mu}, sigma: {sigma}")
             await self._evaluate_outcome(window, outcome, probability)
 
     async def _evaluate_outcome(self, window: _ActiveWindow, outcome: Outcome, probability: float) -> None:
@@ -485,3 +375,66 @@ class StrategyLayer:
             probability=probability,
         )
         await self._execution.converge(signal)
+
+#   --- Commands ---
+    def pause(self) -> None:
+        self._paused = True
+
+    def resume(self) -> None:
+        self._paused = False
+
+    def status_text(self) -> str:
+        if self._window is None:
+            return f"Strategy: no active window yet (paused={self._paused})"
+        w = self._window
+        return f"Strategy:\nwindow={w.slug} current_price={self._current_price} paused={self._paused}"
+
+#   --- Help ---
+    def seed_history(self, closes: list[float]) -> None:
+        """Pre-fills the rolling price history without the live Binance
+        bootstrap fetch -- used by the backtest engine, which already has
+        historical closes loaded from its downloaded data file."""
+        self._gbm.seed(closes)
+
+    def _load_persisted_target_price(self, slug: str) -> Optional[tuple[float, Optional[float]]]:
+        """Recovers the reference_price captured for `slug` before a prior
+        process restart, so a window that's still open picks up exactly
+        where it left off instead of re-capturing a later (and therefore
+        wrong) price from whatever Binance kline arrives next."""
+        if self._state_file_path is None:
+            return None
+        try:
+            data = json.loads(self._state_file_path.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or data.get("slug") != slug:
+            return None
+        price = data.get("reference_price")
+        if price is None:
+            return None
+        return float(price), data.get("reference_price_timestamp")
+
+    def _persist_reference_price(
+        self, slug: str, reference_price: float, reference_price_timestamp: Optional[float]
+    ) -> None:
+        if self._state_file_path is None:
+            return
+        try:
+            self._state_file_path.write_text(
+                json.dumps(
+                    {
+                        "slug": slug,
+                        "reference_price": reference_price,
+                        "reference_price_timestamp": reference_price_timestamp,
+                    }
+                )
+            )
+        except OSError:
+            logger.warning("Failed to persist reference_price for %s", slug)
+
+    def _update_quote(self, outcome: Outcome, bid: Optional[float], ask: Optional[float]) -> None:
+        quote = self._window.quotes[outcome]
+        if bid is not None:
+            quote.bid = bid
+        if ask is not None:
+            quote.ask = ask
