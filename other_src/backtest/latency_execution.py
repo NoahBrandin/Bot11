@@ -25,7 +25,7 @@ from __future__ import annotations
 import bisect
 from typing import Optional
 
-from datastream.events import Side
+from datastream.utils.events import Side
 from execution.base import Order, OrderStatus
 from execution.paper import PaperExecutionLayer
 

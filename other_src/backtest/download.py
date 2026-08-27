@@ -19,9 +19,9 @@ from typing import Awaitable, Callable, Optional, TypeVar
 
 import aiohttp
 
-from datastream.gamma_client import DEFAULT_WINDOW_SECONDS as WINDOW_SECONDS
-from datastream.gamma_client import GammaClient
-from datastream.window_tracker import slug_for
+from datastream.utils.gamma_client import DEFAULT_WINDOW_SECONDS as WINDOW_SECONDS
+from datastream.utils.gamma_client import GammaClient
+from datastream import slug_for
 
 logger = logging.getLogger(__name__)
 

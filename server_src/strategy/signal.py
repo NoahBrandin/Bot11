@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from datastream.events import Outcome
+from datastream.utils.events import Outcome
 
 
 @dataclass(frozen=True, slots=True)

@@ -23,17 +23,24 @@ without Strategy needing to know whether it actually filled. _evaluate()
 itself only runs once per Binance candle close, not on every Polymarket
 price_change tick -- see _on_price_change's comment for why.
 
-Reference-price capture (the BTC price a window's outcome is judged against)
-now happens in the Datastream-Layer: WindowOpenEvent.target_price is set from
-WindowTracker's own view of BinanceFeed.last_closed at the moment the window
-opens (see datastream/window_tracker.py::_open). Strategy just consumes it --
-the REST-fallback/staleness-threshold machinery that used to live here is
-gone. What's still Strategy's job: if target_price arrives None (the
-window's own candle-close raced window-open), capture one late from the
-first kline that closes after open (_on_binance_kline) -- and if the whole
-process restarts mid-window, recognize that a freshly (re)connected
-BinanceFeed's next kline won't reflect the window's true start price either,
-via skip_trading/DEFAULT_LATE_JOIN_THRESHOLD_SECONDS below.
+Both _current_price (the live price _evaluate() compares against target_price)
+and target_price itself (the price a window's outcome is judged against) now
+come from Chainlink (_on_chainlink_price), not Binance -- Chainlink's TWAP is
+the actual price Polymarket resolves against. Its ticks land on exact whole
+seconds, and window_start is always a whole-second (5-minute-aligned)
+boundary too, so target_price capture (_try_capture_target_price) waits
+specifically for the tick whose second matches window_start rather than
+settling for "closest available" -- an exact reference price, not an
+approximation. Chainlink streams continuously regardless of window state, so
+that exact tick may already have arrived (and be sitting in _current_price)
+by the time _on_window_open is processed -- it checks there first, then
+_on_chainlink_price checks again on every subsequent tick until the match
+shows up. If the whole process restarts mid-window, a freshly (re)connected
+ChainlinkFeed has no backlog of the window's true start-of-window tick
+either, so skip_trading blocks capture entirely in that case rather than
+trading off a mismatched reference. Binance klines are now only used for the
+GBM mu/sigma estimator (_on_binance_kline), gated on candle close same as
+before.
 """
 from __future__ import annotations
 
@@ -45,8 +52,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from datastream.events import (
+from datastream.utils.events import (
     BinanceKlineEvent,
+    ChainlinkPriceEvent,
     Event,
     Outcome,
     PolymarketPriceChangeEvent,
@@ -69,13 +77,13 @@ DEFAULT_HISTORY_SIZE = 100
 # aligned one. In steady state, WindowTracker.run() sleeps precisely until
 # window_end and opens the next window within a fraction of a second of its
 # real start; anything past a few seconds means this window was already
-# running when the process (re)started. A restart also means BinanceFeed's
-# last_closed is gone -- the datastream layer has no better a reference
-# price to offer than we do -- so whatever gets captured (from the event's
-# target_price, persisted state, or the next kline) really is "price when we
-# joined", not "price when the window opened". Trading the GBM model off
-# that mismatched reference for the rest of the window risks systematically
-# wrong probabilities. Skip trading that window entirely instead.
+# running when the process (re)started. A restart also means the freshly
+# (re)connected ChainlinkFeed has no backlog of what the price was back at
+# the window's real start -- so whatever gets captured (from persisted state
+# or the next live tick) really is "price when we joined", not "price when
+# the window opened". Trading the GBM model off that mismatched reference
+# for the rest of the window risks systematically wrong probabilities. Skip
+# trading that window entirely instead.
 DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # Half-width of the dead zone around p=0.5: enter an outcome once its
 # modeled probability clears 0.5 + margin, exit once it drops to 0.5 -
@@ -116,6 +124,7 @@ class _Quote:
 class _ActiveWindow:
     slug: str
     condition_id: str
+    window_start: float
     window_end: float
     up_token_id: str
     down_token_id: str
@@ -169,7 +178,11 @@ class StrategyLayer:
             else None
         )
         self._gbm = GBMEstimator(history_size, halflife_samples)
+        # Both sourced from Chainlink now (_on_chainlink_price) -- Binance
+        # klines only drive the GBM estimator these days, see module
+        # docstring.
         self._current_price: Optional[float] = None
+        self._current_price_timestamp: Optional[float] = None
         self._late_join_threshold = late_join_threshold
         self._window: Optional[_ActiveWindow] = None
         # Where the currently-open window's (slug, reference_price) is
@@ -219,19 +232,20 @@ class StrategyLayer:
                 await self._execution.on_window_close(event.slug)
             case BinanceKlineEvent():
                 await self._on_binance_kline(event)
+            case ChainlinkPriceEvent():
+                await self._on_chainlink_price(event)
             case PolymarketPriceChangeEvent():
                 await self._on_price_change(event)
 
 #   --- Event-Handling ---
     async def _on_window_open(self, event: WindowOpenEvent) -> None:
-        target_price = event.target_price
-        target_price_timestamp = event.target_price_timestamp
         recovered = False
-        if target_price is None:
-            persisted = self._load_persisted_target_price(event.slug)
-            if persisted is not None:
-                target_price, target_price_timestamp = persisted
-                recovered = True
+        persisted = self._load_persisted_target_price(event.slug)
+        if persisted is not None:
+            target_price, target_price_timestamp = persisted
+            recovered = True
+        else:
+            target_price, target_price_timestamp = None, None
 
         late_by = self._clock() - event.window_start
         skip_trading = late_by > self._late_join_threshold
@@ -239,6 +253,7 @@ class StrategyLayer:
         self._window = _ActiveWindow(
             slug=event.slug,
             condition_id=event.condition_id,
+            window_start=event.window_start,
             window_end=event.window_end,
             up_token_id=event.up_token_id,
             down_token_id=event.down_token_id,
@@ -251,8 +266,13 @@ class StrategyLayer:
                 "Window %s target_price recovered from persisted state: %s", event.slug, target_price
             )
             self._monitor.info(f"Window {event.slug} target_price recovered from persisted state: {target_price}")
-        elif target_price is not None:
-            self._persist_reference_price(event.slug, target_price, target_price_timestamp)
+        elif self._current_price is not None and self._current_price_timestamp is not None:
+            # Chainlink has been streaming continuously regardless of window
+            # state, so the tick for window_start's own second may already
+            # have arrived and be sitting here -- check now rather than only
+            # in _on_chainlink_price (_try_capture_target_price no-ops if
+            # it's not actually that exact tick).
+            self._try_capture_target_price(self._current_price, self._current_price_timestamp)
 
         if skip_trading:
             logger.warning(
@@ -268,20 +288,21 @@ class StrategyLayer:
             )
         logger.info(
             "Window opened: %s (target_price=%s, skip_trading=%s)",
-            event.slug, target_price, skip_trading,
+            event.slug, self._window.target_price, skip_trading,
         )
-        self._monitor.info(f"Window opened: {event.slug} (target_price={target_price}, skip_trading={skip_trading})")
+        self._monitor.info(
+            f"Window opened: {event.slug} (target_price={self._window.target_price}, skip_trading={skip_trading})"
+        )
 
     async def _on_binance_kline(self, event: BinanceKlineEvent) -> None:
-        self._current_price = event.close
-        if self._window is not None and self._window.target_price is None:
-            self._window.target_price = event.close
-            self._window.target_price_timestamp = event.kline_close_time
-            self._persist_reference_price(self._window.slug, event.close, event.kline_close_time)
-            logger.info("Window %s reference_price captured late: %s", self._window.slug, event.close)
         if event.is_closed:
             self._gbm.add_close(event.close)
             await self._evaluate()
+
+    async def _on_chainlink_price(self, event: ChainlinkPriceEvent) -> None:
+        self._current_price = event.price
+        self._current_price_timestamp = event.source_timestamp
+        self._try_capture_target_price(event.price, event.source_timestamp)
 
     async def _on_price_change(self, event: PolymarketPriceChangeEvent) -> None:
         if self._window is None or event.slug != self._window.slug:
@@ -319,16 +340,11 @@ class StrategyLayer:
         if not window.wants_position[outcome] and not self._paused and probability > self._entry_line:
             if quote.ask is None:
                 return  # can't size an entry without an ask yet, retry next tick
-            if probability <= quote.ask or quote.ask < 0.4:
-                # Probability cleared the entry line, but the market's own
-                # ask already prices in (or exceeds) that probability -- no
-                # edge left to capture (kelly_fraction would size this at
-                # 0 anyway). Don't freeze a zero-edge "position": stay flat
-                # and keep re-checking every tick, so a later tick where the
-                # ask drops back below probability can still enter. Freezing
-                # here would otherwise lock in a permanent 0.0 target until
-                # the exit line, blind to the edge reappearing.
+            if probability <= quote.ask:
                 return
+            if quote.ask < 0.4:
+                return
+
             window.wants_position[outcome] = True
             window.frozen_target_pct[outcome] = self._kelly_multiplier * kelly_fraction(probability, quote.ask)
             window.frozen_price[outcome] = quote.ask
@@ -414,7 +430,7 @@ class StrategyLayer:
             return None
         return float(price), data.get("reference_price_timestamp")
 
-    def _persist_reference_price(
+    def _persist_target_price(
         self, slug: str, reference_price: float, reference_price_timestamp: Optional[float]
     ) -> None:
         if self._state_file_path is None:
@@ -431,6 +447,31 @@ class StrategyLayer:
             )
         except OSError:
             logger.warning("Failed to persist reference_price for %s", slug)
+
+    def _try_capture_target_price(self, price: float, timestamp: float) -> None:
+        """Captures `price` as the active window's target_price once the
+        Chainlink tick for window_start's own second arrives. Chainlink ticks
+        land on exact whole seconds and window_start is always a whole-second
+        (5-minute-aligned) boundary, so waiting for that exact match gives a
+        precise reference price instead of settling for "closest available"
+        -- round() on both sides absorbs float noise from window_start's own
+        now-%-window_seconds computation (see window_tracker.current_window_
+        start), not any imprecision in the Chainlink timestamp itself.
+        Called both right at _on_window_open (in case that tick already
+        arrived just before window-open was processed) and from every
+        _on_chainlink_price tick after that; once target_price is set, every
+        later call is a no-op."""
+        window = self._window
+        if window is None or window.target_price is not None or window.skip_trading:
+            return
+        if round(timestamp) != round(window.window_start):
+            return
+
+        window.target_price = price
+        window.target_price_timestamp = timestamp
+        self._persist_target_price(window.slug, price, timestamp)
+        logger.info("Window %s target_price captured from Chainlink: %s", window.slug, price)
+        self._monitor.info(f"Window {window.slug} target_price captured from Chainlink: {price}")
 
     def _update_quote(self, outcome: Outcome, bid: Optional[float], ask: Optional[float]) -> None:
         quote = self._window.quotes[outcome]

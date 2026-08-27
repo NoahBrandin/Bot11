@@ -39,7 +39,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Optional
 
-from datastream.events import Side
+from datastream.utils.events import Side
 from monitoring import Monitor
 
 from .base import (

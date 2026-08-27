@@ -17,8 +17,8 @@ from typing import Callable, Optional
 
 import aiohttp
 
-from datastream.events import Side
-from datastream.gamma_client import DEFAULT_WINDOW_SECONDS, GammaClient
+from datastream.utils.events import Side
+from datastream.utils.gamma_client import DEFAULT_WINDOW_SECONDS, GammaClient
 from monitoring import Monitor
 
 from .base import (

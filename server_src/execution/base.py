@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional
 
-from datastream.events import Side
+from datastream.utils.events import Side
 from monitoring import Monitor
 
 if TYPE_CHECKING:

@@ -74,8 +74,5 @@ class BinanceFeed:
             volume=float(k["v"]),
             is_closed=bool(k["x"]),
         )
-        logger.info(event)
         if event.is_closed:
-            logger.info(f"Binance candle closed: {event}")
-            self._monitor.event(f"Binance candle closed: {event}")
-        self._queue.put_nowait(event)
+            self._queue.put_nowait(event)

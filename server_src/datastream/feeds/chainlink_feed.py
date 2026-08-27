@@ -80,6 +80,4 @@ class ChainlinkFeed:
             window_seconds=payload.window_seconds,
             source_timestamp=payload.timestamp / 1000,
         )
-        logger.info(chainlink_event)
-        self._monitor.event(f"Chainlink TWAP update: {chainlink_event}")
         self._queue.put_nowait(chainlink_event)

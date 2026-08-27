@@ -163,5 +163,4 @@ class PolymarketFeed:
                 best_bid=float(change["best_bid"]) if change.get("best_bid") is not None else None,
                 best_ask=float(change["best_ask"]) if change.get("best_ask") is not None else None,
             )
-
         self._queue.put_nowait(event)

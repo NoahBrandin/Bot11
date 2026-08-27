@@ -19,7 +19,7 @@ import json
 import logging
 import math
 
-from datastream.events import (
+from datastream.utils.events import (
     BinanceKlineEvent,
     Outcome,
     PolymarketPriceChangeEvent,
