@@ -8,11 +8,6 @@ from collections import deque
 from statistics import fmean, stdev
 from typing import Optional, Sequence
 
-
-def log_returns(closes: Sequence[float]) -> list[float]:
-    return [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
-
-
 class GBMEstimator:
     """Incrementally maintains (mu, sigma) from a stream of price samples,
     equivalent to calling estimate_params/estimate_params_ewma on the whole
@@ -117,19 +112,70 @@ def probability_up(
     minutes_remaining: float,
     mu: float,
     sigma: float,
+    twap_window_minutes: float = 0.0,
 ) -> float:
-    """P(S_T >= reference_price) under GBM, T = minutes_remaining, starting
-    from current_price with drift/vol estimated per-minute."""
+    """P(A_T >= reference_price) under GBM, where A_T is the price at window
+    close -- a point value if twap_window_minutes is 0 (the default, and the
+    only behavior before Chainlink TWAP resolution), or the trailing
+    time-weighted average over the last twap_window_minutes if set.
+
+    mu/sigma are per-minute GBM parameters estimated from Binance's *raw*
+    spot returns (see GBMEstimator) -- but Polymarket's actual settlement
+    price is a Chainlink TWAP, not a spot price, and averaging mechanically
+    reduces variance relative to a terminal point value. Plugging spot sigma
+    straight into the point-value formula overstates how much the eventual
+    TWAP can move, skewing probabilities toward the extremes. See
+    _twap_adjusted_horizon for the correction."""
     if minutes_remaining <= 0:
         return 1.0 if current_price >= reference_price else 0.0
 
-    drift_term = math.log(current_price / reference_price) + (mu - 0.5 * sigma**2) * minutes_remaining
-    vol_term = sigma * math.sqrt(minutes_remaining)
+    drift_time, var_time = _twap_adjusted_horizon(minutes_remaining, twap_window_minutes)
+
+    drift_term = math.log(current_price / reference_price) + (mu - 0.5 * sigma**2) * drift_time
+    vol_term = sigma * math.sqrt(var_time)
 
     if vol_term == 0:
         return 1.0 if drift_term >= 0 else 0.0
 
     return _standard_normal_cdf(drift_term / vol_term)
+
+
+def _twap_adjusted_horizon(minutes_remaining: float, twap_window_minutes: float) -> tuple[float, float]:
+    """Effective (drift_time, variance_time) to plug into the point-value GBM
+    formula so it instead prices A_T = (1/w) integral[T-w, T] S_u du -- the
+    trailing w-minute time-weighted average ending at T = minutes_remaining
+    from now -- instead of the terminal point S_T.
+
+    Writing log S_u = log S_0 + (mu - sigma^2/2)*u + sigma*W_u for standard
+    Brownian motion W, the deterministic drift term averages to (mu -
+    sigma^2/2) * (1/w) integral[T-w,T] u du = (mu - sigma^2/2) * (T - w/2) --
+    exact for T >= w, since that integral doesn't care whether T-w is
+    positive.
+
+    The random part is sigma * A where A = (1/w) integral[T-w,T] W_u du.
+    For T >= w, decompose W_u = W_{T-w} + (W_u - W_{T-w}); the first term
+    is a single Gaussian with Var = T-w, and by independent increments the
+    second averages to an independent term with the classic continuous-
+    average-of-BM variance w/3 (Var[(1/L) integral[0,L] W_s ds] = L/3). So
+    Var[A] = (T-w) + w/3 = T - (2/3)*w exactly.
+
+    For T < w, the window [T-w, T] starts before "now" -- part of it is
+    already realized, information this function doesn't have access to
+    (that would need a running buffer of the actual historical TWAP path,
+    which correlates with current_price's own trailing window too -- not
+    implemented). Below is an extrapolation, not a derivation: it matches
+    both the T>=w formulas and their limit at exactly T=w (T/2 = T-w/2 and
+    T/3 = T-2w/3 when T=w), and correctly goes to zero as T->0 (settlement
+    is fully determined the instant the window closes), but doesn't account
+    for the correlation with what current_price already partially knows
+    about that overlapping historical segment."""
+    if twap_window_minutes <= 0:
+        return minutes_remaining, minutes_remaining
+
+    t, w = minutes_remaining, twap_window_minutes
+    if t >= w:
+        return t - w / 2.0, t - (2.0 / 3.0) * w
+    return t / 2.0, t / 3.0
 
 
 def _standard_normal_cdf(z: float) -> float:

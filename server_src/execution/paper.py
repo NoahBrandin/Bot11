@@ -166,7 +166,19 @@ class PaperExecutionLayer(ExecutionLayer):
                 up_paid = await self.settle(market.up_token_id, market.up_payout)
                 down_paid = await self.settle(market.down_token_id, market.down_payout)
                 if up_paid or down_paid:
-                    logger.info("Settled %s: up=%.4f down=%.4f", slug, up_paid, down_paid)
+                    logger.info(
+                        "Settled %s: up=%.4f down=%.4f", slug, up_paid, down_paid,
+                        extra={
+                            "event": "settlement",
+                            "slug": slug,
+                            "up_token_id": market.up_token_id,
+                            "down_token_id": market.down_token_id,
+                            "up_payout": market.up_payout,
+                            "down_payout": market.down_payout,
+                            "up_paid": up_paid,
+                            "down_paid": down_paid,
+                        },
+                    )
                     self._monitor.execution(f"Settled {slug}: up={up_paid:.4f} down={down_paid:.4f}")
                 return
 

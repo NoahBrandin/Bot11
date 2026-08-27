@@ -183,6 +183,11 @@ class StrategyLayer:
         # docstring.
         self._current_price: Optional[float] = None
         self._current_price_timestamp: Optional[float] = None
+        # The Chainlink TWAP's own averaging window (seconds), from the most
+        # recent ChainlinkPriceEvent -- fed into probability_up's TWAP
+        # variance correction (see gbm.py). None until the first tick
+        # arrives, same as _current_price.
+        self._chainlink_window_seconds: Optional[float] = None
         self._late_join_threshold = late_join_threshold
         self._window: Optional[_ActiveWindow] = None
         # Where the currently-open window's (slug, reference_price) is
@@ -302,6 +307,7 @@ class StrategyLayer:
     async def _on_chainlink_price(self, event: ChainlinkPriceEvent) -> None:
         self._current_price = event.price
         self._current_price_timestamp = event.source_timestamp
+        self._chainlink_window_seconds = event.window_seconds
         self._try_capture_target_price(event.price, event.source_timestamp)
 
     async def _on_price_change(self, event: PolymarketPriceChangeEvent) -> None:
@@ -324,7 +330,10 @@ class StrategyLayer:
             return
 
         mu, sigma = self._gbm.mu, self._gbm.sigma
-        p_up = probability_up(self._current_price, window.target_price, minutes_remaining, mu, sigma)
+        twap_window_minutes = (self._chainlink_window_seconds or 0.0) / 60.0
+        p_up = probability_up(
+            self._current_price, window.target_price, minutes_remaining, mu, sigma, twap_window_minutes
+        )
         probabilities = {Outcome.UP: p_up, Outcome.DOWN: 1.0 - p_up}
 
         for outcome, probability in probabilities.items():
@@ -332,9 +341,11 @@ class StrategyLayer:
                                f"btc_price:{self._current_price}, target_price:{window.target_price} mu: {mu}, sigma: {sigma}")
             logger.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, "
                                f"btc_price:{self._current_price}, target_price:{window.target_price} mu: {mu}, sigma: {sigma}")
-            await self._evaluate_outcome(window, outcome, probability)
+            await self._evaluate_outcome(window, outcome, probability, twap_window_minutes)
 
-    async def _evaluate_outcome(self, window: _ActiveWindow, outcome: Outcome, probability: float) -> None:
+    async def _evaluate_outcome(
+        self, window: _ActiveWindow, outcome: Outcome, probability: float, twap_window_minutes: float
+    ) -> None:
         quote = window.quotes[outcome]
 
         if not window.wants_position[outcome] and not self._paused and probability > self._entry_line:
@@ -389,6 +400,9 @@ class StrategyLayer:
             target_pct=target_pct,
             price=price,
             probability=probability,
+            target_price=window.target_price,
+            current_price=self._current_price,
+            twap_window_minutes=twap_window_minutes,
         )
         await self._execution.converge(signal)
 

@@ -23,3 +23,11 @@ class Signal:
     target_pct: float  # fraction of bankroll wanted in this outcome; 0.0 == flat
     price: float  # ask when entering, bid-or-ask-fallback when exiting
     probability: float  # modeled P(outcome) at decision time -- for logging only
+    # Below: the GBM inputs behind `probability`, carried along purely so
+    # ExecutionLayer.converge() can log them structured alongside the fill --
+    # a durable, queryable per-trade record of what the model believed at
+    # decision time, which performance_review.py's docstring notes doesn't
+    # otherwise exist anywhere (see execution/base.py's converge()).
+    target_price: float
+    current_price: float
+    twap_window_minutes: float

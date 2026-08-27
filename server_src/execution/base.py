@@ -211,7 +211,30 @@ class ExecutionLayer(ABC):
         )
 
         self.results.put_nowait(result)
-        logger.info("Execution result: %s", result)
+        logger.info(
+            "Execution result: %s",
+            result,
+            extra={
+                "event": "order_result",
+                "slug": signal.slug,
+                "condition_id": signal.condition_id,
+                "asset_id": signal.asset_id,
+                "outcome": signal.outcome.value,
+                "probability": signal.probability,
+                "target_price": signal.target_price,
+                "current_price": signal.current_price,
+                "twap_window_minutes": signal.twap_window_minutes,
+                "target_pct": signal.target_pct,
+                "signal_price": signal.price,
+                "action": order.action.value,
+                "order_size": order.size,
+                "order_price": order.price,
+                "status": result.status.value,
+                "filled_price": result.filled_price,
+                "filled_size": result.filled_size,
+                "reason": result.reason,
+            },
+        )
 
         summary = (
             f"{result.status.value}: {order.action.value} {signal.outcome.value} "
