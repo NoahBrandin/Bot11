@@ -99,7 +99,8 @@ class PolymarketPriceChangeEvent(Event):
 class ChainlinkPriceEvent(Event):
     symbol: str
     price: float
-    # Time-weighted average window this price was computed over (30s for
-    # 5-min markets, 60s for 15-min/4h markets) -- see chainlink_feed.py.
+    # Time-weighted average window this price was computed over -- 60s for
+    # our 5-min BTC up/down markets (confirmed from an actual market's
+    # resolution text, see chainlink_feed.py's module docstring).
     window_seconds: int
     source_timestamp: float

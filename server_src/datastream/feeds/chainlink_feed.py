@@ -1,10 +1,12 @@
 """Chainlink TWAP price feed for Polymarket's crypto up/down markets, via the
 official `polymarket-client` SDK's streams API.
 
-This is the literal price Polymarket's 5-min BTC market resolves against (a
-30-second time-weighted average of Chainlink's price -- 15-min/4h markets use
-a 60s window instead; see
-https://docs.polymarket.com/market-data/chainlink-twap), unlike
+This is the literal price Polymarket's 5-min BTC market resolves against. Its
+own resolution rules name the 60-second Chainlink TWAP stream explicitly
+(https://data.chain.link/streams/btc-usd-twap-60s-streams) -- confirmed by
+reading an actual market's resolution text, not Polymarket's docs page
+(https://docs.polymarket.com/market-data/chainlink-twap), which claims a 30s
+window for 5-min markets and turned out to be wrong/stale. Unlike
 binance_feed.py's klines, which are only ever a proxy the strategy trades
 against, not the settlement price.
 
@@ -36,7 +38,7 @@ from datastream.utils.events import ChainlinkPriceEvent
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYMBOL = "btc/usd"
-DEFAULT_WINDOW_SECONDS = 30
+DEFAULT_WINDOW_SECONDS = 60
 DEFAULT_RECONNECT_DELAY = 2.0
 
 
