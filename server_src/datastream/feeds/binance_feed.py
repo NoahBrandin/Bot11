@@ -11,7 +11,7 @@ import websockets
 
 from monitoring import Monitor
 
-from .events import BinanceKlineEvent
+from datastream.utils.events import BinanceKlineEvent
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,6 @@ class BinanceFeed:
         self._url = f"{BASE_WS_URL}/{symbol.lower()}@kline_{interval}"
         self._monitor = monitor or Monitor()
         self._reconnect_delay = reconnect_delay
-        self.last_closed: Optional[BinanceKlineEvent] = None
 
     async def run(self) -> None:
         while True:
@@ -75,6 +74,8 @@ class BinanceFeed:
             volume=float(k["v"]),
             is_closed=bool(k["x"]),
         )
+        logger.info(event)
         if event.is_closed:
-            self.last_closed = event
+            logger.info(f"Binance candle closed: {event}")
+            self._monitor.event(f"Binance candle closed: {event}")
         self._queue.put_nowait(event)

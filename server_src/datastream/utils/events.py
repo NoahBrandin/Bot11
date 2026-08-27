@@ -63,9 +63,6 @@ class WindowOpenEvent(Event):
     window_end: float
     up_token_id: str
     down_token_id: str
-    target_price: Optional[float] = None
-    target_price_timestamp: Optional[float] = None
-
 
 @dataclass(frozen=True, slots=True)
 class WindowCloseEvent(Event):
@@ -89,3 +86,20 @@ class PolymarketPriceChangeEvent(Event):
     side: Side
     best_bid: float | None
     best_ask: float | None
+
+
+# ---------------------------------------------------------------------------
+# Chainlink price feed (relayed via Polymarket's RTDS) -- this is the price
+# source Polymarket's crypto up/down markets actually resolve against, as
+# opposed to BinanceKlineEvent above which is only ever a proxy the strategy
+# trades against.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class ChainlinkPriceEvent(Event):
+    symbol: str
+    price: float
+    # Time-weighted average window this price was computed over (30s for
+    # 5-min markets, 60s for 15-min/4h markets) -- see chainlink_feed.py.
+    window_seconds: int
+    source_timestamp: float

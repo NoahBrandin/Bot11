@@ -16,7 +16,7 @@ import websockets
 
 from monitoring import Monitor
 
-from .events import (
+from datastream.utils.events import (
     Outcome,
     PolymarketPriceChangeEvent,
     Side,
@@ -152,8 +152,7 @@ class PolymarketFeed:
         if not self._should_emit(asset_id, "price_change", now):
             return
         slug, outcome = info
-        self._queue.put_nowait(
-            PolymarketPriceChangeEvent(
+        event = PolymarketPriceChangeEvent(
                 timestamp=now,
                 slug=slug,
                 asset_id=asset_id,
@@ -164,4 +163,5 @@ class PolymarketFeed:
                 best_bid=float(change["best_bid"]) if change.get("best_bid") is not None else None,
                 best_ask=float(change["best_ask"]) if change.get("best_ask") is not None else None,
             )
-        )
+
+        self._queue.put_nowait(event)

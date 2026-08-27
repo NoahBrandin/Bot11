@@ -8,10 +8,11 @@ python-dotenv>=1.0
 
 # Polymarket's official SDK (import name `polymarket`) -- AsyncSecureClient
 # for live order placement/balances (execution/live.py), AsyncPublicClient
-# for read-only wallet queries (performance_review.py). See
-# server_src/execution/live.py's module docstring for why this SDK was
-# chosen over py_clob_client_v2.
-polymarket-client
+# for read-only wallet queries (performance_review.py) and for the Chainlink
+# TWAP price stream (datastream/chainlink_feed.py, needs >=0.3.0 for
+# polymarket.streams). See server_src/execution/live.py's module docstring
+# for why this SDK was chosen over py_clob_client_v2.
+polymarket-client>=0.3.0
 
 # Equity-curve/drawdown/PnL-distribution chart in performance_review.py.
 matplotlib>=3.8

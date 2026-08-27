@@ -41,11 +41,14 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from datastream import DatastreamLayer
-from datastream.binance_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_BINANCE_RECONNECT_DELAY
-from datastream.gamma_client import DEFAULT_WINDOW_SECONDS
-from datastream.polymarket_feed import DEFAULT_APP_PING_INTERVAL, DEFAULT_POLYMARKET_POLL_INTERVAL
-from datastream.polymarket_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_POLYMARKET_RECONNECT_DELAY
-from datastream.window_tracker import DEFAULT_FETCH_RETRY_DELAY, DEFAULT_PREFETCH_LEAD_SECONDS
+from datastream.feeds.binance_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_BINANCE_RECONNECT_DELAY
+from datastream.feeds.chainlink_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_CHAINLINK_RECONNECT_DELAY
+from datastream.feeds.chainlink_feed import DEFAULT_SYMBOL as DEFAULT_CHAINLINK_SYMBOL
+from datastream.feeds.chainlink_feed import DEFAULT_WINDOW_SECONDS as DEFAULT_CHAINLINK_WINDOW_SECONDS
+from datastream.utils.gamma_client import DEFAULT_WINDOW_SECONDS
+from datastream.feeds.polymarket_feed import DEFAULT_APP_PING_INTERVAL, DEFAULT_POLYMARKET_POLL_INTERVAL
+from datastream.feeds.polymarket_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_POLYMARKET_RECONNECT_DELAY
+from datastream.utils.window_tracker import DEFAULT_FETCH_RETRY_DELAY, DEFAULT_PREFETCH_LEAD_SECONDS
 from execution import ExecutionLayer, ExecutionResult, LiveExecutionLayer, PaperExecutionLayer
 from execution.base import (
     DEFAULT_MAX_POSITION_NOTIONAL,
@@ -93,6 +96,9 @@ class Config:
     binance_reconnect_delay: float
     polymarket_reconnect_delay: float
     polymarket_app_ping_interval: float
+    chainlink_symbol: str
+    chainlink_window_seconds: int
+    chainlink_reconnect_delay: float
     window_seconds: float
     prefetch_lead_seconds: float
     window_fetch_retry_delay: float
@@ -128,6 +134,13 @@ def load_config() -> Config:
         ),
         polymarket_app_ping_interval=env_config.env_float(
             "DATASTREAM_POLYMARKET_APP_PING_INTERVAL_SECONDS", DEFAULT_APP_PING_INTERVAL
+        ),
+        chainlink_symbol=env_config.env_str("CHAINLINK_SYMBOL", DEFAULT_CHAINLINK_SYMBOL),
+        chainlink_window_seconds=env_config.env_int(
+            "CHAINLINK_WINDOW_SECONDS", DEFAULT_CHAINLINK_WINDOW_SECONDS
+        ),
+        chainlink_reconnect_delay=env_config.env_float(
+            "DATASTREAM_CHAINLINK_RECONNECT_DELAY_SECONDS", DEFAULT_CHAINLINK_RECONNECT_DELAY
         ),
         window_seconds=env_config.env_float("DATASTREAM_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS),
         prefetch_lead_seconds=env_config.env_float(
@@ -183,6 +196,9 @@ def _build_datastream_layer(config: Config, monitor: Monitor) -> DatastreamLayer
         binance_reconnect_delay=config.binance_reconnect_delay,
         polymarket_reconnect_delay=config.polymarket_reconnect_delay,
         polymarket_app_ping_interval=config.polymarket_app_ping_interval,
+        chainlink_symbol=config.chainlink_symbol,
+        chainlink_window_seconds=config.chainlink_window_seconds,
+        chainlink_reconnect_delay=config.chainlink_reconnect_delay,
         window_seconds=config.window_seconds,
         prefetch_lead_seconds=config.prefetch_lead_seconds,
         window_fetch_retry_delay=config.window_fetch_retry_delay,
