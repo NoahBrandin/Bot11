@@ -8,6 +8,7 @@ from .events import (
     WindowOpenEvent,
 )
 from .manager import DatastreamLayer
+from .window_tracker import slug_for
 
 __all__ = [
     "BinanceKlineEvent",
@@ -18,4 +19,5 @@ __all__ = [
     "Side",
     "WindowCloseEvent",
     "WindowOpenEvent",
+    "slug_for",
 ]
