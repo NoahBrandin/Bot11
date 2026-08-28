@@ -100,5 +100,8 @@ class LatencyModelingPaperExecutionLayer(PaperExecutionLayer):
                     ),
                 )
 
-        repriced = Order(asset_id=order.asset_id, action=order.action, price=fill_price, size=order.size)
+        repriced = Order(
+            asset_id=order.asset_id, action=order.action, price=fill_price, size=order.size,
+            probability=order.probability, sigma=order.sigma, minutes_remaining=order.minutes_remaining,
+        )
         return await super()._place_order(repriced)

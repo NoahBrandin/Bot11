@@ -31,3 +31,14 @@ class Signal:
     target_price: float
     current_price: float
     twap_window_minutes: float
+    # GBM sigma (per-minute log-return stdev) and time-to-expiry at decision
+    # time -- not used for probability at all, carried purely so
+    # LiveExecutionLayer can size its FAK price-protection band off actual
+    # market-movement risk instead of a fixed constant (see execution/live.py's
+    # _price_protection_tolerance). minutes_remaining in particular matters
+    # because probability_up's sensitivity to a given BTC move grows sharply
+    # as time-to-expiry shrinks (vol_term = sigma*sqrt(minutes_remaining)
+    # shrinks), so the book can gap further, faster, right before a window
+    # closes than mid-window.
+    sigma: float
+    minutes_remaining: float

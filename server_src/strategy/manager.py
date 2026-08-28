@@ -330,10 +330,11 @@ class StrategyLayer:
             return
 
         mu, sigma = self._gbm.mu, self._gbm.sigma
+        # No longer fed into probability_up() -- see its docstring -- but
+        # still carried onto Signal purely as logging context (which
+        # Chainlink TWAP window was active for this decision).
         twap_window_minutes = (self._chainlink_window_seconds or 0.0) / 60.0
-        p_up = probability_up(
-            self._current_price, window.target_price, minutes_remaining, mu, sigma, twap_window_minutes
-        )
+        p_up = probability_up(self._current_price, window.target_price, minutes_remaining, mu, sigma)
         probabilities = {Outcome.UP: p_up, Outcome.DOWN: 1.0 - p_up}
 
         for outcome, probability in probabilities.items():
@@ -341,10 +342,16 @@ class StrategyLayer:
                                f"btc_price:{self._current_price}, target_price:{window.target_price} mu: {mu}, sigma: {sigma}")
             logger.info(f"Outcome: {outcome}, probability: {probability}, quote: {window.quotes[outcome]}, "
                                f"btc_price:{self._current_price}, target_price:{window.target_price} mu: {mu}, sigma: {sigma}")
-            await self._evaluate_outcome(window, outcome, probability, twap_window_minutes)
+            await self._evaluate_outcome(window, outcome, probability, twap_window_minutes, sigma, minutes_remaining)
 
     async def _evaluate_outcome(
-        self, window: _ActiveWindow, outcome: Outcome, probability: float, twap_window_minutes: float
+        self,
+        window: _ActiveWindow,
+        outcome: Outcome,
+        probability: float,
+        twap_window_minutes: float,
+        sigma: float,
+        minutes_remaining: float,
     ) -> None:
         quote = window.quotes[outcome]
 
@@ -403,6 +410,8 @@ class StrategyLayer:
             target_price=window.target_price,
             current_price=self._current_price,
             twap_window_minutes=twap_window_minutes,
+            sigma=sigma,
+            minutes_remaining=minutes_remaining,
         )
         await self._execution.converge(signal)
 

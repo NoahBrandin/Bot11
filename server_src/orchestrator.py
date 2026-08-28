@@ -55,7 +55,14 @@ from execution.base import (
     DEFAULT_REJECTION_ALERT_THRESHOLD,
     DEFAULT_RETRY_COOLDOWN_SECONDS,
 )
-from execution.live import DEFAULT_BANKROLL_CACHE_SECONDS, DEFAULT_PRICE_PROTECTION_TOLERANCE
+from execution.live import (
+    DEFAULT_BANKROLL_CACHE_SECONDS,
+    DEFAULT_ENTRY_EDGE_CAP_FRACTION,
+    DEFAULT_EXIT_TOLERANCE_MULTIPLIER,
+    DEFAULT_MAX_PRICE_PROTECTION_TOLERANCE,
+    DEFAULT_PRICE_PROTECTION_TOLERANCE,
+    DEFAULT_VOLATILITY_TOLERANCE_SCALE,
+)
 from execution.live_report import build_status_report, resolve_wallet_address
 from execution.paper import (
     DEFAULT_SETTLEMENT_MAX_WAIT_SECONDS,
@@ -116,6 +123,10 @@ class Config:
     paper_settlement_max_wait_seconds: float
     live_bankroll_cache_seconds: float
     live_price_protection_tolerance: float
+    live_max_price_protection_tolerance: float
+    live_volatility_tolerance_scale: float
+    live_entry_edge_cap_fraction: float
+    live_exit_tolerance_multiplier: float
 
 
 def load_config() -> Config:
@@ -184,6 +195,18 @@ def load_config() -> Config:
         live_price_protection_tolerance=env_config.env_float(
             "LIVE_PRICE_PROTECTION_TOLERANCE", DEFAULT_PRICE_PROTECTION_TOLERANCE
         ),
+        live_max_price_protection_tolerance=env_config.env_float(
+            "LIVE_MAX_PRICE_PROTECTION_TOLERANCE", DEFAULT_MAX_PRICE_PROTECTION_TOLERANCE
+        ),
+        live_volatility_tolerance_scale=env_config.env_float(
+            "LIVE_VOLATILITY_TOLERANCE_SCALE", DEFAULT_VOLATILITY_TOLERANCE_SCALE
+        ),
+        live_entry_edge_cap_fraction=env_config.env_float(
+            "LIVE_ENTRY_EDGE_CAP_FRACTION", DEFAULT_ENTRY_EDGE_CAP_FRACTION
+        ),
+        live_exit_tolerance_multiplier=env_config.env_float(
+            "LIVE_EXIT_TOLERANCE_MULTIPLIER", DEFAULT_EXIT_TOLERANCE_MULTIPLIER
+        ),
     )
 
 
@@ -244,6 +267,10 @@ def _build_execution_layer(config: Config, monitor: Monitor) -> ExecutionLayer:
             max_position_notional=config.execution_max_position_notional,
             bankroll_cache_seconds=config.live_bankroll_cache_seconds,
             price_protection_tolerance=config.live_price_protection_tolerance,
+            max_price_protection_tolerance=config.live_max_price_protection_tolerance,
+            volatility_tolerance_scale=config.live_volatility_tolerance_scale,
+            entry_edge_cap_fraction=config.live_entry_edge_cap_fraction,
+            exit_tolerance_multiplier=config.live_exit_tolerance_multiplier,
         )
 
     raise ValueError(f"Invalid EXECUTION_MODE {mode!r}: must be 'paper' or 'live'")

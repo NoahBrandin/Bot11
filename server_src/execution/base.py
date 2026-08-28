@@ -72,6 +72,13 @@ class Order:
     action: Side
     price: float
     size: float
+    # Decision-time context carried through purely so LiveExecutionLayer can
+    # size its FAK price-protection band dynamically (see execution/live.py's
+    # _price_protection_tolerance) -- meaningless to PaperExecutionLayer,
+    # which ignores them and fills at exactly `price`.
+    probability: float
+    sigma: float
+    minutes_remaining: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +188,10 @@ class ExecutionLayer(ABC):
             return None
 
         action = Side.BUY if delta > 0 else Side.SELL
-        order = Order(asset_id=signal.asset_id, action=action, price=signal.price, size=abs(delta))
+        order = Order(
+            asset_id=signal.asset_id, action=action, price=signal.price, size=abs(delta),
+            probability=signal.probability, sigma=signal.sigma, minutes_remaining=signal.minutes_remaining,
+        )
         self._last_attempt[key] = now
 
         self._monitor.order(
