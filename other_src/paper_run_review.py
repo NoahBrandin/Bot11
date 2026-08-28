@@ -10,6 +10,7 @@ chain, and even live's own wallet API doesn't expose what the model believed
 at decision time. Works for either mode's log, since converge() is shared.
 
     python paper_run_review.py [LOG_FILE] [--chart-output FILE] [--no-chart]
+        [--no-verify]
 
 LOG_FILE defaults to bot11.jsonl (orchestrator.py's default log path when run
 from the working directory it was started in). P&L includes Polymarket's
@@ -17,20 +18,37 @@ documented crypto-category taker fee (see execution/paper.py's
 DEFAULT_TAKER_FEE_RATE) applied the same way paper fills are -- exact for
 paper-mode data, an approximation for live (whose real fee/fills the wallet
 API would need to confirm exactly).
+
+By default this re-derives every entered position's settlement payout itself,
+straight from Gamma (see fetch_true_settlements), rather than trusting the
+log's own `event: "settlement"` line -- execution/paper.py::_settle_window
+used to credit whatever interim, not-yet-resolved price Gamma's outcomePrices
+happened to show a couple seconds after window close (fixed to require
+market.closed, but any log written before that fix still has the wrong
+number baked in, and there's no way to tell from the log line alone). Pass
+--no-verify to skip the network calls and trust the log's settlement events
+as-is (e.g. for offline review, or a log already known to postdate the fix).
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import fmean
 from typing import Optional
 
+_SERVER_SRC = Path(__file__).resolve().parent.parent / "server_src"
+if str(_SERVER_SRC) not in sys.path:
+    sys.path.insert(0, str(_SERVER_SRC))
+
 DEFAULT_LOG_FILE = "bot11.jsonl"
 DEFAULT_CHART_OUTPUT = "paper_run_chart.png"
 TAKER_FEE_RATE = 0.07  # mirrors execution/paper.py's DEFAULT_TAKER_FEE_RATE
 CALIBRATION_BUCKETS = [(0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
+GAMMA_VERIFY_CONCURRENCY = 5
 
 
 @dataclass
@@ -131,6 +149,52 @@ def _apply_settlement(positions: dict[tuple[str, str], Position], record: dict) 
             positions[key].settlement_payout = payout
 
 
+async def fetch_true_settlements(slugs: list[str]) -> dict[str, tuple[float, float]]:
+    """Queries Gamma directly for each window's real, oracle-resolved $0/$1
+    payout -- independent of whatever (possibly stale/buggy) value the log's
+    own settlement event recorded. Only returns an entry for slugs Gamma
+    reports as genuinely `closed`; a window that hasn't resolved yet (still
+    open, or Gamma just hasn't observed it yet) is simply omitted, same as
+    "not settled yet" from the log's point of view."""
+    import aiohttp
+    from datastream.utils.gamma_client import GammaClient
+
+    resolved: dict[str, tuple[float, float]] = {}
+    semaphore = asyncio.Semaphore(GAMMA_VERIFY_CONCURRENCY)
+
+    async with aiohttp.ClientSession() as session:
+        gamma = GammaClient(session)
+
+        async def _fetch(slug: str) -> None:
+            async with semaphore:
+                try:
+                    market = await gamma.fetch_window_market(slug)
+                except Exception as exc:
+                    print(f"  WARNING: failed to verify {slug} against Gamma: {exc}")
+                    return
+            if market is not None and market.closed and market.up_payout is not None and market.down_payout is not None:
+                resolved[slug] = (market.up_payout, market.down_payout)
+
+        await asyncio.gather(*(_fetch(slug) for slug in slugs))
+    return resolved
+
+
+def apply_true_settlements(
+    positions: dict[tuple[str, str], Position], resolved: dict[str, tuple[float, float]]
+) -> None:
+    """Overwrites each entered position's settlement_payout with Gamma's
+    verified truth wherever available -- takes priority over whatever the
+    log's own settlement event said (see fetch_true_settlements)."""
+    for (slug, outcome), pos in positions.items():
+        if pos.entry_probability is None:
+            continue
+        payouts = resolved.get(slug)
+        if payouts is None:
+            continue
+        up_payout, down_payout = payouts
+        pos.settlement_payout = up_payout if outcome == "Up" else down_payout
+
+
 def print_summary(positions: dict[tuple[str, str], Position]) -> list[Position]:
     entered = [p for p in positions.values() if p.entry_probability is not None]
     settled = [p for p in entered if p.realized_pnl is not None]
@@ -190,6 +254,10 @@ def main() -> None:
     parser.add_argument("log_file", nargs="?", default=DEFAULT_LOG_FILE)
     parser.add_argument("--chart-output", default=DEFAULT_CHART_OUTPUT)
     parser.add_argument("--no-chart", action="store_true")
+    parser.add_argument(
+        "--no-verify", action="store_true",
+        help="Trust the log's own settlement events as-is instead of re-checking each window against Gamma",
+    )
     args = parser.parse_args()
 
     log_path = Path(args.log_file)
@@ -197,6 +265,15 @@ def main() -> None:
         raise SystemExit(f"Log file not found: {log_path}")
 
     positions = load_positions(log_path)
+
+    if not args.no_verify:
+        entered_slugs = sorted({p.slug for p in positions.values() if p.entry_probability is not None})
+        if entered_slugs:
+            print(f"Verifying {len(entered_slugs)} entered window(s) against Gamma's real resolution...")
+            resolved = asyncio.run(fetch_true_settlements(entered_slugs))
+            apply_true_settlements(positions, resolved)
+            print(f"  {len(resolved)}/{len(entered_slugs)} confirmed closed & resolved so far\n")
+
     settled = print_summary(positions)
 
     if settled and not args.no_chart:

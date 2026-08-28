@@ -85,10 +85,14 @@ logger = logging.getLogger("orchestrator")
 # mismatched-case) default.
 DEFAULT_BINANCE_SYMBOL = "BTCUSDT"
 DEFAULT_BINANCE_INTERVAL = "1m"
-# Dedicated high-frequency feed for gbm.py's two-scale realized-variance
-# estimator (see strategy/manager.py's DEFAULT_GBM_TICK_INTERVAL) -- "" here
-# would fall back to feeding GBM off the 1-min decision-cadence feed instead,
-# same as before this existed. Live deployment wants it on by default.
+# Tells gbm.py's two-scale realized-variance estimator (via StrategyLayer's
+# gbm_tick_interval) what spacing to assume between the price samples it's
+# fed -- not a separate WS subscription: DatastreamLayer's single BinanceFeed
+# now forwards every kline update (open candles included, not just closes,
+# see binance_feed.py), and StrategyLayer._on_binance_kline feeds GBM off all
+# of them, whatever interval that single feed is actually subscribed at. ""
+# would fall back to assuming binance_interval's spacing instead (the
+# pre-two-scale-estimator default).
 DEFAULT_BINANCE_TICK_INTERVAL = "1s"
 
 # Rotating JSON-lines log file, independent of journald's own retention --
@@ -221,7 +225,6 @@ def _build_datastream_layer(config: Config, monitor: Monitor) -> DatastreamLayer
     return DatastreamLayer(
         binance_symbol=config.binance_symbol,
         binance_interval=config.binance_interval,
-        binance_tick_interval=config.binance_tick_interval,
         monitor=monitor,
         polymarket_poll_interval=config.polymarket_poll_interval,
         binance_reconnect_delay=config.binance_reconnect_delay,

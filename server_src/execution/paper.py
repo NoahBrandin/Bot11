@@ -162,7 +162,13 @@ class PaperExecutionLayer(ExecutionLayer):
                 logger.exception("Failed fetching resolution for %s", slug)
                 self._monitor.error(f"Failed fetching resolution for {slug}")
 
-            if market is not None and market.up_payout is not None and market.down_payout is not None:
+            # market.up_payout/down_payout come straight from Gamma's
+            # outcomePrices, which is populated for an actively-trading
+            # market too (the current traded price, not yet a $0/$1
+            # payout) -- without the closed check this settles at whatever
+            # noisy interim price the first poll (2s after window close)
+            # happens to catch, well before the oracle actually resolves.
+            if market is not None and market.closed and market.up_payout is not None and market.down_payout is not None:
                 up_paid = await self.settle(market.up_token_id, market.up_payout)
                 down_paid = await self.settle(market.down_token_id, market.down_payout)
                 if up_paid or down_paid:

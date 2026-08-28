@@ -19,9 +19,11 @@ above), and resubmitting a stale price once the market has moved on has no
 chance of matching. Converge() is idempotent, so re-emitting the same
 Signal on every _evaluate() (rather than only on a state change) is cheap
 and safe, and is what lets a too-small or rejected attempt keep retrying
-without Strategy needing to know whether it actually filled. _evaluate()
-itself only runs once per Binance candle close, not on every Polymarket
-price_change tick -- see _on_price_change's comment for why.
+without Strategy needing to know whether it actually filled. _evaluate() runs
+on every Binance candle close *and* every Polymarket price_change tick (see
+_on_price_change) -- probability only moves on the former, but the execution
+price (frozen_price) needs to track the latter as closely as possible, since
+that's what actually determines whether a FAK order matches.
 
 Both _current_price (the live price _evaluate() compares against target_price)
 and target_price itself (the price a window's outcome is judged against) now
@@ -86,11 +88,14 @@ DEFAULT_HISTORY_SIZE = 6000
 # real start; anything past a few seconds means this window was already
 # running when the process (re)started. A restart also means the freshly
 # (re)connected ChainlinkFeed has no backlog of what the price was back at
-# the window's real start -- so whatever gets captured (from persisted state
-# or the next live tick) really is "price when we joined", not "price when
-# the window opened". Trading the GBM model off that mismatched reference
-# for the rest of the window risks systematically wrong probabilities. Skip
-# trading that window entirely instead.
+# the window's real start -- so if there's no persisted target_price either,
+# whatever gets captured next (from the next live tick) really is "price
+# when we joined", not "price when the window opened", and trading the GBM
+# model off that mismatched reference for the rest of the window risks
+# systematically wrong probabilities. Skip trading that window entirely in
+# that case. Doesn't apply when target_price *was* recovered from persisted
+# state (see _on_window_open) -- that's the exact true window_start price,
+# captured before the restart, so a late rejoin has no reason to distrust it.
 DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # Half-width of the dead zone around p=0.5: enter an outcome once its
 # modeled probability clears 0.5 + margin, exit once it drops to 0.5 -
@@ -110,23 +115,15 @@ DEFAULT_PROBABILITY_MARGIN = 0.02
 DEFAULT_EWMA_HALFLIFE_SECONDS: Optional[float] = 30.0
 # Disabled by default -- see StrategyLayer._state_file_path.
 DEFAULT_STATE_FILE_PATH = ""
-# "" disables: gbm.py's GBMEstimator is fed straight from the decision-cadence
-# feed (binance_interval, both add_price and _evaluate() on every close --
-# the original, single-feed behavior; what other_src/backtest/engine.py still
-# gets, since it never passes this). Set to e.g. "1s" to feed the estimator
-# from a separate, higher-frequency BinanceFeed instead (see
-# DatastreamLayer.binance_tick_interval) -- _on_binance_kline then splits
-# add_price (from this interval) and _evaluate() (from binance_interval)
-# across the two feeds instead of doing both off one.
+# Tells gbm.py's GBMEstimator what spacing to assume between the price
+# samples _on_binance_kline feeds it -- not a separate feed subscription;
+# DatastreamLayer's single BinanceFeed forwards every kline update (open
+# candles included, see binance_feed.py) at whatever interval it's
+# subscribed at, and every one of them goes to both add_price and
+# _evaluate() (see _on_binance_kline). "" falls back to assuming
+# binance_interval's own spacing instead -- what
+# other_src/backtest/engine.py gets, since it never passes this.
 DEFAULT_GBM_TICK_INTERVAL = ""
-# Binance's REST klines endpoint hard-caps `limit` at 1000 regardless of what
-# a caller requests -- fetch_recent_closes's warmup bootstrap must stay under
-# that or the API call itself fails. At "1s" resolution this is ~16.5 minutes
-# of instant warmup (vs. history_size's full window, e.g. 6000 -> 100 min) --
-# the remainder fills in from the live tick feed over the following ~83
-# minutes after each (re)start, same self-healing "ready flips late" behavior
-# as the seed-vs-ready off-by-one noted in gbm.py's TwoScaleRealizedVariance.
-MAX_SINGLE_BOOTSTRAP_FETCH = 999
 
 _INTERVAL_SECONDS = {"1s": 1.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
 
@@ -174,7 +171,7 @@ class StrategyLayer:
         execution: ExecutionLayer,
         history_size: int = DEFAULT_HISTORY_SIZE,
         binance_symbol: str = "BTCUSDT",
-        binance_interval: str = "1s",
+        binance_interval: str = "1m",
         monitor: Optional[Monitor] = None,
         clock: Callable[[], float] = time.time,
         probability_margin: float = DEFAULT_PROBABILITY_MARGIN,
@@ -233,7 +230,7 @@ class StrategyLayer:
         closes = await fetch_recent_closes(
             symbol=self._binance_symbol,
             interval=self._gbm_tick_interval or self._binance_interval,
-            count=min(self._history_size, MAX_SINGLE_BOOTSTRAP_FETCH),
+            count=self._history_size,
         )
         self._gbm.seed(closes)
         logger.info("Bootstrapped %d GBM ticks of BTC price history", len(closes))
@@ -275,7 +272,11 @@ class StrategyLayer:
             target_price, target_price_timestamp = None, None
 
         late_by = self._clock() - event.window_start
-        skip_trading = late_by > self._late_join_threshold
+        # A recovered target_price is the real window_start price, captured
+        # before this process (re)started -- a late rejoin doesn't make it
+        # stale, so it shouldn't trigger the mid-window-join skip below (see
+        # DEFAULT_LATE_JOIN_THRESHOLD_SECONDS).
+        skip_trading = not recovered and late_by > self._late_join_threshold
 
         self._window = _ActiveWindow(
             slug=event.slug,
@@ -336,6 +337,18 @@ class StrategyLayer:
         if self._window is None or event.slug != self._window.slug:
             return
         self._update_quote(event.outcome, event.best_bid, event.best_ask)
+        # Re-evaluate on every quote tick, not just once per Binance candle
+        # close: probability itself only moves on a real BTC/vol update, but
+        # frozen_price (the actual order price -- see _evaluate_outcome's
+        # "track" branch) was only ever refreshed on that same once-a-minute
+        # cadence, even though Polymarket's book can gap in a fraction of
+        # that time. Polymarket's own execution guidance is to "recalculate
+        # price estimates immediately before submission" -- this is that,
+        # using data already sitting in memory (no extra network call, no
+        # added latency). _evaluate() is cheap (closed-form probability calc)
+        # and converge() is idempotent/cooldown-gated, so evaluating more
+        # often costs nothing beyond a slightly fresher price.
+        await self._evaluate()
 
 #   --- Evaluation ---
     async def _evaluate(self) -> None:
@@ -345,6 +358,8 @@ class StrategyLayer:
         if window.skip_trading:
             return
         if not self._gbm.ready:
+            logger.info("GBM not ready, skipping trading for it")
+            self._monitor.info("GBM not ready, skipping trading for it")
             return
 
         minutes_remaining = (window.window_end - self._clock()) / 60.0

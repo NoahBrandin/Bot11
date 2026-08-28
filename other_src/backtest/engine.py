@@ -19,8 +19,11 @@ import json
 import logging
 import math
 
+from collections import deque
+
 from datastream.utils.events import (
     BinanceKlineEvent,
+    ChainlinkPriceEvent,
     Outcome,
     PolymarketPriceChangeEvent,
     Side,
@@ -55,6 +58,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_SPREAD_HALF_WIDTH = 0.005
 MIN_PRICE = 0.01
 MAX_PRICE = 0.99
+
+# download.py fetches Binance klines/ticks and Polymarket prices-history, but
+# no historical Chainlink TWAP series (no such public endpoint was found when
+# it was written) -- yet target_price/current_price capture (see manager.py's
+# module docstring) has run entirely off ChainlinkPriceEvent since the TWAP
+# migration, and this replay never emitted one, so target_price stayed None
+# for every window and nothing ever traded. Approximated here as a rolling
+# trailing-window_seconds mean of the Binance tick series (or, lacking ticks,
+# the raw 1m kline closes -- no sub-minute data to average, so it degrades to
+# spot instead of a real TWAP) -- not the real Chainlink value, but far closer
+# to what Polymarket actually settled against than raw spot, and enough to
+# make the backtest trade at all again.
+CHAINLINK_WINDOW_SECONDS = 60.0
 
 _KLINE_PRIORITY = 0
 _WINDOW_OPEN_PRIORITY = 1
@@ -92,6 +108,18 @@ async def run_backtest(
         return
 
     klines = sorted(data["binance_klines"], key=lambda k: k["t"])
+    # Optional: only present in files downloaded with download.py's 1s
+    # TICK_INTERVAL (see other_src/data/backtest_data_5d_ticks.json vs. older
+    # files without it). When present, replayed as intra-minute
+    # BinanceKlineEvents with is_closed=False (see _make_tick_event) --
+    # feeding strategy.utils.gbm.GBMEstimator the same high-frequency price
+    # series the live single BinanceFeed now forwards (binance_feed.py
+    # doesn't filter is_closed anymore), without also firing _evaluate() on
+    # every second the way an is_closed=True tick would (see
+    # StrategyLayer._on_binance_kline) -- decision cadence stays tied to the
+    # 1m klines' actual closes, exactly matching live.
+    ticks = sorted(data.get("binance_ticks", []), key=lambda t: t["t"])
+    chainlink_source = _compute_twap_series(ticks, CHAINLINK_WINDOW_SECONDS) if ticks else klines
 
     clock = SimulatedClock()
     execution = LatencyModelingPaperExecutionLayer(
@@ -116,24 +144,17 @@ async def run_backtest(
 
     execution.on_window_close = _no_network_settlement
 
-    # Mirrors _no_network_settlement above: manager.py's reference-price
-    # capture falls back to a live Binance REST call when the kline feed
-    # looks stale or missing at window open (see
-    # StrategyLayer._resolve_live_reference_price). In this offline replay
-    # there's no real connection to be stale -- _current_price is simply
-    # unset until the first kline event lands (e.g. every backtest's very
-    # first window, before any kline has been replayed yet) -- so stub the
-    # fallback to return None, which reproduces the pre-fallback behavior of
-    # deferring capture to the next kline tick, instead of making a live
-    # network call mid-replay.
-    async def _no_network_price_fallback(symbol: str) -> None:
-        return None
-
     strategy = StrategyLayer(
         execution=execution,
         clock=clock,
-        price_fallback=_no_network_price_fallback,
         ewma_halflife_seconds=ewma_halflife_seconds,
+        # Matches orchestrator.py's live default whenever this data file has
+        # ticks to actually back it up -- gbm.py's GBMEstimator needs to know
+        # 1s (not the 1m klines') spacing, or its two-scale correction's
+        # subsample grids are calibrated against the wrong sample count.
+        # "" (old default) for tick-less files falls back to binance_interval
+        # ("1m"), same as before ticks existed here at all.
+        gbm_tick_interval="1s" if ticks else "",
     )
 
     # Per-trade log: wraps converge() (the one chokepoint every order attempt
@@ -190,12 +211,39 @@ async def run_backtest(
 
     first_window_start = windows[0]["window_start"]
     kline_idx = 0
-    warmup_closes = []
-    while kline_idx < len(klines) and klines[kline_idx]["t"] < first_window_start:
-        warmup_closes.append(klines[kline_idx]["c"])
-        kline_idx += 1
-    strategy.seed_history(warmup_closes)
-    logger.info("Seeded %d minutes of warmup history", len(warmup_closes))
+    tick_idx = 0
+    chainlink_idx = 0
+    # Chainlink streams continuously in live regardless of window state (see
+    # manager.py's module docstring) -- replay it through warmup too, so
+    # _current_price is already populated by the time window 0's
+    # WindowOpenEvent fires, exactly like _on_window_open's own "may have
+    # already arrived" check expects.
+    while chainlink_idx < len(chainlink_source) and chainlink_source[chainlink_idx]["t"] <= first_window_start:
+        point = chainlink_source[chainlink_idx]
+        clock.set(point["t"])
+        await strategy.handle_event(_make_chainlink_event(point))
+        chainlink_idx += 1
+    # download.py only fetches binance_ticks across the actual backtest
+    # range, not the extra warmup lead-in (its comment: "warmup only feeds
+    # the GBM's per-minute mu/sigma history, which is 1m-close data
+    # regardless") -- there is no pre-window tick data to seed from. Seeding
+    # from klines instead (1m-spaced) while gbm_tick_interval="1s" assumes 1s
+    # spacing would misconfigure TwoScaleRealizedVariance's subsample grids
+    # (see gbm.py), so ticked backtests skip pre-fill and self-warm from the
+    # replay stream instead -- history_size=6000 at ~300 ticks/5-min window
+    # means roughly the first 20 windows run un-ready (no trading) before
+    # gbm.ready flips true, a small fraction of any multi-day backtest.
+    if ticks:
+        while kline_idx < len(klines) and klines[kline_idx]["t"] < first_window_start:
+            kline_idx += 1
+        logger.info("Ticks available -- skipping kline-based warmup, self-warming from replay instead")
+    else:
+        warmup_closes = []
+        while kline_idx < len(klines) and klines[kline_idx]["t"] < first_window_start:
+            warmup_closes.append(klines[kline_idx]["c"])
+            kline_idx += 1
+        strategy.seed_history(warmup_closes)
+        logger.info("Seeded %d minutes of warmup history", len(warmup_closes))
 
     for i, window in enumerate(windows):
         window_start = window["window_start"]
@@ -211,6 +259,16 @@ async def run_backtest(
         while kline_idx < len(klines) and klines[kline_idx]["t"] <= window_end:
             events.append((klines[kline_idx]["t"], _KLINE_PRIORITY, _make_kline_event(klines[kline_idx])))
             kline_idx += 1
+
+        while tick_idx < len(ticks) and ticks[tick_idx]["t"] <= window_end:
+            events.append((ticks[tick_idx]["t"], _KLINE_PRIORITY, _make_tick_event(ticks[tick_idx])))
+            tick_idx += 1
+
+        while chainlink_idx < len(chainlink_source) and chainlink_source[chainlink_idx]["t"] <= window_end:
+            events.append(
+                (chainlink_source[chainlink_idx]["t"], _KLINE_PRIORITY, _make_chainlink_event(chainlink_source[chainlink_idx]))
+            )
+            chainlink_idx += 1
 
         events.append(
             (
@@ -360,6 +418,58 @@ def _make_kline_event(k: dict) -> BinanceKlineEvent:
         close=close,
         volume=0.0,
         is_closed=True,
+    )
+
+
+def _make_tick_event(t: dict) -> BinanceKlineEvent:
+    # is_closed=False, unlike _make_kline_event's 1m events -- these feed
+    # gbm.py's GBMEstimator (via StrategyLayer._on_binance_kline's unconditional
+    # add_price) without also triggering _evaluate() on every second, mirroring
+    # how live's single BinanceFeed now forwards intra-candle kline pushes
+    # (binance_feed.py no longer filters on is_closed) while only the actual
+    # candle close carries is_closed=True.
+    close = t["c"]
+    return BinanceKlineEvent(
+        timestamp=t["t"],
+        symbol="BTCUSDT",
+        interval="1s",
+        kline_open_time=t["t"] - 1.0,
+        kline_close_time=t["t"],
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=0.0,
+        is_closed=False,
+    )
+
+
+def _compute_twap_series(ticks: list[dict], window_seconds: float) -> list[dict]:
+    """Rolling trailing-window_seconds mean of 1s tick closes, one point per
+    tick -- see CHAINLINK_WINDOW_SECONDS. Ticks are exactly 1s apart (see
+    download.py), so a fixed-length sliding window is exact, not approximate.
+    """
+    span = max(round(window_seconds), 1)
+    window: deque[float] = deque(maxlen=span)
+    total = 0.0
+    out = []
+    for tick in ticks:
+        price = tick["c"]
+        if len(window) == span:
+            total -= window[0]
+        window.append(price)
+        total += price
+        out.append({"t": tick["t"], "c": total / len(window)})
+    return out
+
+
+def _make_chainlink_event(point: dict) -> ChainlinkPriceEvent:
+    return ChainlinkPriceEvent(
+        timestamp=point["t"],
+        symbol="btc/usd",
+        price=point["c"],
+        window_seconds=CHAINLINK_WINDOW_SECONDS,
+        source_timestamp=point["t"],
     )
 
 
