@@ -192,7 +192,12 @@ def apply_true_settlements(
         if payouts is None:
             continue
         up_payout, down_payout = payouts
-        pos.settlement_payout = up_payout if outcome == "Up" else down_payout
+        payout_price = up_payout if outcome == "Up" else down_payout
+        # realized_pnl adds settlement_payout to net_cash_flow as a dollar
+        # amount (matching the log-based path, where PaperExecutionLayer.
+        # settle() already logged size * payout_price) -- payout_price alone
+        # is just the $0/$1 per-share price, not the position's payout.
+        pos.settlement_payout = pos.net_shares * payout_price
 
 
 def print_summary(positions: dict[tuple[str, str], Position]) -> list[Position]:
