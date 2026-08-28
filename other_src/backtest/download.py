@@ -50,26 +50,30 @@ T = TypeVar("T")
 
 
 async def _with_retry(request: Callable[[], Awaitable[T]], description: str) -> T:
-    """Retries on 429/5xx with exponential backoff + jitter. Anything else
-    (4xx client errors, non-HTTP exceptions) raises immediately."""
+    """Retries on 429/5xx and connection-level timeouts/disconnects with
+    exponential backoff + jitter. Anything else (4xx client errors, other
+    non-HTTP exceptions) raises immediately."""
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return await request()
         except aiohttp.ClientResponseError as exc:
             if exc.status != 429 and exc.status < 500:
                 raise
-            if attempt == RETRY_ATTEMPTS - 1:
-                raise
-            delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 0.5)
-            logger.warning(
-                "%s failed (status=%s), retrying in %.1fs (attempt %d/%d)",
-                description,
-                exc.status,
-                delay,
-                attempt + 1,
-                RETRY_ATTEMPTS,
-            )
-            await asyncio.sleep(delay)
+            status, last_exc = exc.status, exc
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as exc:
+            status, last_exc = type(exc).__name__, exc
+        if attempt == RETRY_ATTEMPTS - 1:
+            raise last_exc
+        delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 0.5)
+        logger.warning(
+            "%s failed (status=%s), retrying in %.1fs (attempt %d/%d)",
+            description,
+            status,
+            delay,
+            attempt + 1,
+            RETRY_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
     raise AssertionError("unreachable")
 
 

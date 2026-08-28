@@ -10,6 +10,14 @@ AsyncPublicClient only.
 
     python performance_review.py [--address 0x...] [--recent-trades N]
         [--chart-output FILE] [--no-chart]
+        [--since DATE] [--until DATE] [--days N]
+
+--since/--until accept 'YYYY-MM-DD' or a full ISO datetime (naive values are
+treated as UTC); --days N is shorthand for --since being N days ago. They
+scope realized P&L, trades, and the chart to positions/trades that closed or
+executed in that window -- open positions and current portfolio value are
+always "as of now" regardless of the window, since there's no past state to
+show for still-open risk.
 
 Mirrors other_src/backtest/analysis.py's positions_summary as closely as
 the public Data API allows: win rate, avg/median PnL, avg win/loss, profit
@@ -28,7 +36,7 @@ import asyncio
 import logging
 import os
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import fmean, median
 from types import SimpleNamespace
@@ -54,8 +62,26 @@ def resolve_address(cli_address: Optional[str]) -> str:
     return address
 
 
-def _header(address: str) -> str:
-    return f"Polymarket Performance Review\nWallet: {address}\n" + "=" * 60
+def _parse_time_arg(value: str) -> datetime:
+    """Accepts 'YYYY-MM-DD' or a full ISO datetime (e.g.
+    '2026-08-01T12:00:00'); naive values are treated as UTC since that's
+    what every timestamp elsewhere in this report is compared against."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise SystemExit(f"Could not parse time '{value}' -- use YYYY-MM-DD or a full ISO datetime.")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _header(address: str, since: Optional[datetime] = None, until: Optional[datetime] = None) -> str:
+    header = f"Polymarket Performance Review\nWallet: {address}"
+    if since is not None or until is not None:
+        since_str = since.strftime("%Y-%m-%d %H:%M UTC") if since is not None else "the beginning"
+        until_str = until.strftime("%Y-%m-%d %H:%M UTC") if until is not None else "now"
+        header += f"\nWindow: {since_str} -> {until_str}"
+    return header + "\n" + "=" * 60
 
 
 async def _print_portfolio_value(client: AsyncPublicClient, address: str) -> None:
@@ -73,12 +99,36 @@ async def _print_portfolio_value(client: AsyncPublicClient, address: str) -> Non
         print(f"  Current value: ${amount:,.2f}")
 
 
-async def _collect_closed_positions(client: AsyncPublicClient, address: str) -> list:
+async def _collect_closed_positions(
+    client: AsyncPublicClient,
+    address: str,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+) -> list:
     try:
         # The closed-positions endpoint caps page_size at 50 (unlike open
         # positions/trades, which accept larger pages) -- iter_items() still
-        # walks every page regardless of page size.
-        return [p async for p in client.list_closed_positions(user=address, page_size=50).iter_items()]
+        # walks every page regardless of page size. The API has no
+        # start/end filter for this endpoint (unlike list_trades), so when a
+        # window is given, page newest-first and stop as soon as we're past
+        # `since` -- avoids walking a long-running wallet's entire history
+        # just to answer "what closed in this window" (mirrors
+        # server_src/execution/live_report.py's _collect_closed_positions_since).
+        if since is None and until is None:
+            return [p async for p in client.list_closed_positions(user=address, page_size=50).iter_items()]
+        out = []
+        paginator = client.list_closed_positions(
+            user=address, page_size=50, sort_by="TIMESTAMP", sort_direction="DESC"
+        )
+        async for p in paginator.iter_items():
+            if p.timestamp is None:
+                continue
+            if until is not None and p.timestamp > until:
+                continue
+            if since is not None and p.timestamp < since:
+                break
+            out.append(p)
+        return out
     except Exception as exc:
         print(f"\n-- Realized P&L (Closed Positions) --\n  (failed to fetch closed positions: {exc})")
         return []
@@ -437,9 +487,18 @@ def _print_pending_redemption(stuck: list) -> None:
     )
 
 
-async def _collect_all_trades(client: AsyncPublicClient, address: str) -> list:
+async def _collect_all_trades(
+    client: AsyncPublicClient,
+    address: str,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+) -> list:
     try:
-        return [t async for t in client.list_trades(user=address, page_size=500).iter_items()]
+        start = int(since.timestamp()) if since is not None else None
+        end = int(until.timestamp()) if until is not None else None
+        return [
+            t async for t in client.list_trades(user=address, page_size=500, start=start, end=end).iter_items()
+        ]
     except Exception as exc:
         print(f"\n-- First-Trade Direction --\n  (failed to fetch trade history: {exc})")
         return []
@@ -698,17 +757,18 @@ def _print_time_bucket_summary(rows: list[dict]) -> None:
         print(f"    pnl per sell: {pnl_per_sell_str}")
 
 
-async def _print_recent_trades(client: AsyncPublicClient, address: str, limit: int) -> None:
+def _print_recent_trades(all_trades: list, limit: int) -> None:
+    """Takes its slice from the already-fetched, already-window-filtered
+    `all_trades` (see _collect_all_trades) rather than a separate
+    unfiltered API call, so a --since/--until window scopes this list too
+    instead of always showing whatever's most recent overall. list_trades
+    returns newest-first by default (unaffected by the start/end filters),
+    so the first `limit` items are the most recent within the window."""
     print(f"\n-- Recent Trades (up to {limit}) --")
-    try:
-        page = await client.list_trades(user=address, page_size=limit).first_page()
-    except Exception as exc:
-        print(f"  (failed to fetch trades: {exc})")
-        return
-    if not page.items:
+    if not all_trades:
         print("  No trades yet.")
         return
-    for t in page.items:
+    for t in all_trades[:limit]:
         ts = t.timestamp.strftime("%Y-%m-%d %H:%M") if t.timestamp else "?"
         title = (t.title or t.condition_id or "unknown")[:35]
         side = t.side or "?"
@@ -718,18 +778,35 @@ async def _print_recent_trades(client: AsyncPublicClient, address: str, limit: i
 
 
 async def run_review(
-    address: str, *, recent_trades: int = 20, chart_output: Optional[str] = DEFAULT_CHART_OUTPUT
+    address: str,
+    *,
+    recent_trades: int = 20,
+    chart_output: Optional[str] = DEFAULT_CHART_OUTPUT,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
 ) -> None:
     async with AsyncPublicClient() as client:
-        print(_header(address))
+        print(_header(address, since, until))
         await _print_portfolio_value(client, address)
-        closed_raw = await _collect_closed_positions(client, address)
+        closed_raw = await _collect_closed_positions(client, address, since, until)
         positions = await _collect_open_positions(client, address)
 
         stuck = _stuck_positions(positions)
         stuck_ids = {id(p) for p in stuck}
         active = [p for p in positions if id(p) not in stuck_ids]
-        closed = closed_raw + [_as_closed(p) for p in stuck]
+        stuck_closed = [_as_closed(p) for p in stuck]
+        # Stuck (resolved-but-unredeemed) positions have no server-side
+        # timestamp filter to apply, since they're derived from currently
+        # -open positions -- filter their derived resolution time locally
+        # against the same window.
+        if since is not None or until is not None:
+            stuck_closed = [
+                p for p in stuck_closed
+                if p.timestamp is not None
+                and (since is None or p.timestamp >= since)
+                and (until is None or p.timestamp <= until)
+            ]
+        closed = closed_raw + stuck_closed
 
         stats = _positions_summary(closed)
         _print_trade_status(closed, active)
@@ -737,13 +814,13 @@ async def run_review(
         _print_open_positions(active)
         _print_pending_redemption(stuck)
 
-        all_trades = await _collect_all_trades(client, address)
+        all_trades = await _collect_all_trades(client, address, since, until)
         _print_close_method_summary(_close_method_summary(closed, all_trades))
         _print_first_trade_direction(_first_trade_direction(all_trades, closed))
         bucket_rows = _time_bucket_summary(all_trades, closed)
         _print_time_bucket_summary(bucket_rows)
 
-        await _print_recent_trades(client, address, recent_trades)
+        _print_recent_trades(all_trades, recent_trades)
 
         if chart_output is not None:
             written = _render_chart(closed, active, bucket_rows, chart_output)
@@ -762,11 +839,34 @@ def main() -> None:
         "--chart-output", default=DEFAULT_CHART_OUTPUT, help="Path to write the performance chart PNG"
     )
     parser.add_argument("--no-chart", action="store_true", help="Skip generating the chart")
+    parser.add_argument(
+        "--since", default=None, type=_parse_time_arg,
+        help="Only include positions/trades from this time on (YYYY-MM-DD or ISO datetime, UTC if no tz given)",
+    )
+    parser.add_argument(
+        "--until", default=None, type=_parse_time_arg,
+        help="Only include positions/trades up to this time (YYYY-MM-DD or ISO datetime, UTC if no tz given)",
+    )
+    parser.add_argument(
+        "--days", default=None, type=float,
+        help="Shorthand for --since being N days ago (overridden by an explicit --since)",
+    )
     args = parser.parse_args()
 
     address = resolve_address(args.address)
     chart_output = None if args.no_chart else args.chart_output
-    asyncio.run(run_review(address, recent_trades=args.recent_trades, chart_output=chart_output))
+    since = args.since
+    if since is None and args.days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=args.days)
+    asyncio.run(
+        run_review(
+            address,
+            recent_trades=args.recent_trades,
+            chart_output=chart_output,
+            since=since,
+            until=args.until,
+        )
+    )
 
 
 if __name__ == "__main__":

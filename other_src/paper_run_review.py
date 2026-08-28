@@ -43,17 +43,27 @@ class Position:
     current_price: Optional[float] = None
     twap_window_minutes: Optional[float] = None
     net_cash_flow: float = 0.0  # cumulative buy/sell cash flow so far, fee-inclusive
+    net_shares: float = 0.0
     settlement_payout: Optional[float] = None
 
     def apply_fill(self, action: str, price: float, size: float) -> None:
         fee = TAKER_FEE_RATE * size * price * (1.0 - price)
         if action == "BUY":
             self.net_cash_flow -= price * size + fee
+            self.net_shares += size
         else:
             self.net_cash_flow += price * size - fee
+            self.net_shares -= size
 
     @property
     def realized_pnl(self) -> Optional[float]:
+        # PaperExecutionLayer only logs a settlement line when a payout is
+        # nonzero (see _settle_window's `if up_paid or down_paid:`), so a
+        # position fully sold back to flat before window close never gets
+        # one -- but there's nothing left to settle either, so net_cash_flow
+        # alone is already the final number, not a missing one.
+        if abs(self.net_shares) < 1e-6:
+            return self.net_cash_flow
         if self.settlement_payout is None:
             return None
         return self.net_cash_flow + self.settlement_payout
@@ -66,20 +76,34 @@ class Position:
 
 def load_positions(log_file: Path) -> dict[tuple[str, str], Position]:
     positions: dict[tuple[str, str], Position] = {}
+    bad_lines = 0
     with log_file.open(encoding="utf-8") as f:
-        for line in f:
+        for i, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                # Seen in practice: a single log record split across two
+                # physical lines, likely two writers (e.g. LOG_FILE_PATH's
+                # file handler and a shell `>` redirect of the same stdout)
+                # both appending to the same file without coordination. Warn
+                # rather than silently drop it -- a dropped fill can quietly
+                # misclassify an otherwise-closed position as still open.
+                bad_lines += 1
                 continue
             event = record.get("event")
             if event == "order_result":
                 _apply_order(positions, record)
             elif event == "settlement":
                 _apply_settlement(positions, record)
+    if bad_lines:
+        print(
+            f"WARNING: {bad_lines} unparseable log line(s) skipped -- if you're piping the same "
+            "process's stdout to a file *and* have LOG_FILE_PATH set, that's likely two writers "
+            "racing on one file; use only one.\n"
+        )
     return positions
 
 

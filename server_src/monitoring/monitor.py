@@ -48,6 +48,7 @@ class MonitorCategory(str, Enum):
     EXECUTION = "EXECUTION"
     ERROR = "ERROR"
     INFO = "INFO"
+    DEBUG = "DEBUG"
 
 
 class Monitor:
@@ -80,6 +81,9 @@ class Monitor:
 
     def info(self, message: str) -> None:
         self._notify(MonitorCategory.INFO, message)
+
+    def debug(self, message: str) -> None:
+        self._notify(MonitorCategory.DEBUG, message)
 
     def _notify(self, category: MonitorCategory, message: str) -> None:
         if self._telegram is None or category not in self._enabled:

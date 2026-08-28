@@ -85,6 +85,11 @@ logger = logging.getLogger("orchestrator")
 # mismatched-case) default.
 DEFAULT_BINANCE_SYMBOL = "BTCUSDT"
 DEFAULT_BINANCE_INTERVAL = "1m"
+# Dedicated high-frequency feed for gbm.py's two-scale realized-variance
+# estimator (see strategy/manager.py's DEFAULT_GBM_TICK_INTERVAL) -- "" here
+# would fall back to feeding GBM off the 1-min decision-cadence feed instead,
+# same as before this existed. Live deployment wants it on by default.
+DEFAULT_BINANCE_TICK_INTERVAL = "1s"
 
 # Rotating JSON-lines log file, independent of journald's own retention --
 # see json_logging.py and main() below. 10MB x 5 backups is a fixed cap
@@ -99,6 +104,7 @@ class Config:
     execution_mode: str
     binance_symbol: str
     binance_interval: str
+    binance_tick_interval: str
     polymarket_poll_interval: float
     binance_reconnect_delay: float
     polymarket_reconnect_delay: float
@@ -134,6 +140,7 @@ def load_config() -> Config:
         execution_mode=env_config.env_str("EXECUTION_MODE", "paper").strip().lower() or "paper",
         binance_symbol=env_config.env_str("BINANCE_SYMBOL", DEFAULT_BINANCE_SYMBOL),
         binance_interval=env_config.env_str("BINANCE_INTERVAL", DEFAULT_BINANCE_INTERVAL),
+        binance_tick_interval=env_config.env_str("BINANCE_TICK_INTERVAL", DEFAULT_BINANCE_TICK_INTERVAL),
         polymarket_poll_interval=env_config.env_float(
             "POLYMARKET_POLL_INTERVAL", DEFAULT_POLYMARKET_POLL_INTERVAL
         ),
@@ -214,6 +221,7 @@ def _build_datastream_layer(config: Config, monitor: Monitor) -> DatastreamLayer
     return DatastreamLayer(
         binance_symbol=config.binance_symbol,
         binance_interval=config.binance_interval,
+        binance_tick_interval=config.binance_tick_interval,
         monitor=monitor,
         polymarket_poll_interval=config.polymarket_poll_interval,
         binance_reconnect_delay=config.binance_reconnect_delay,
@@ -234,6 +242,7 @@ def _build_strategy_layer(config: Config, execution: ExecutionLayer, monitor: Mo
         history_size=config.strategy_history_size,
         binance_symbol=config.binance_symbol,
         binance_interval=config.binance_interval,
+        gbm_tick_interval=config.binance_tick_interval,
         monitor=monitor,
         probability_margin=config.strategy_probability_margin,
         kelly_multiplier=config.strategy_kelly_multiplier,

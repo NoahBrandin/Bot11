@@ -71,7 +71,14 @@ from .signal import Signal
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HISTORY_SIZE = 100
+# Unit changed from "minutes" to "GBM ticks" (see DEFAULT_GBM_TICK_INTERVAL)
+# -- with the default "1s" tick interval, 6000 preserves the old ~100-minute
+# calibration depth (100 * 60). A pre-existing STRATEGY_HISTORY_SIZE in .env
+# from before this change now means seconds, not minutes -- 100 would give a
+# ~1.7-minute window, far too short for TwoScaleRealizedVariance's subsample
+# grids (default target_slow_spacing_seconds=120 alone needs >=120 ticks just
+# to ever become ready) -- worth checking/updating if you have that set.
+DEFAULT_HISTORY_SIZE = 6000
 # How far past event.window_start this process's _on_window_open can fire
 # before treating it as a late/mid-window join rather than a boundary-
 # aligned one. In steady state, WindowTracker.run() sleeps precisely until
@@ -93,19 +100,33 @@ DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # tick-to-tick noise; this default needs empirical tuning (e.g. a paper-mode
 # observation run) before being trusted live.
 DEFAULT_PROBABILITY_MARGIN = 0.02
-# Switches the GBMEstimator from a flat rolling-window mean/stdev to
-# recency-weighted EWMA mode -- see gbm.py. 30s picked from a 5-day backtest
-# comparison (2026-08-22, other_src/run_backtest.py --ewma-halflife-seconds):
-# 30/60/120s all beat the flat-window baseline on 1-minute data (+12-22% more
-# realized P&L, similar ROI%), with 30s the best of the three. None disables
-# EWMA entirely, back to the original flat-window estimate_params behavior.
-# Expressed in seconds (not samples) so it stays meaningful independent of
-# binance_interval/history resolution; converted to samples via
-# _interval_seconds(binance_interval) once at construction (see
-# StrategyLayer.__init__).
+# No longer consumed: gbm.py's GBMEstimator was EWMA-based (this picked its
+# recency-weighting halflife, validated by a 2026-08-22 backtest sweep) until
+# it was replaced by a two-scale-realized-variance estimator with mu fixed at
+# 0 (martingale assumption) -- see gbm.py's module docstring. Kept as a
+# StrategyLayer.__init__ parameter/Config field rather than removed outright,
+# since ripping it out would ripple into orchestrator.py/config.py for no
+# behavioral gain; ewma_halflife_seconds is accepted but ignored below.
 DEFAULT_EWMA_HALFLIFE_SECONDS: Optional[float] = 30.0
 # Disabled by default -- see StrategyLayer._state_file_path.
 DEFAULT_STATE_FILE_PATH = ""
+# "" disables: gbm.py's GBMEstimator is fed straight from the decision-cadence
+# feed (binance_interval, both add_price and _evaluate() on every close --
+# the original, single-feed behavior; what other_src/backtest/engine.py still
+# gets, since it never passes this). Set to e.g. "1s" to feed the estimator
+# from a separate, higher-frequency BinanceFeed instead (see
+# DatastreamLayer.binance_tick_interval) -- _on_binance_kline then splits
+# add_price (from this interval) and _evaluate() (from binance_interval)
+# across the two feeds instead of doing both off one.
+DEFAULT_GBM_TICK_INTERVAL = ""
+# Binance's REST klines endpoint hard-caps `limit` at 1000 regardless of what
+# a caller requests -- fetch_recent_closes's warmup bootstrap must stay under
+# that or the API call itself fails. At "1s" resolution this is ~16.5 minutes
+# of instant warmup (vs. history_size's full window, e.g. 6000 -> 100 min) --
+# the remainder fills in from the live tick feed over the following ~83
+# minutes after each (re)start, same self-healing "ready flips late" behavior
+# as the seed-vs-ready off-by-one noted in gbm.py's TwoScaleRealizedVariance.
+MAX_SINGLE_BOOTSTRAP_FETCH = 999
 
 _INTERVAL_SECONDS = {"1s": 1.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
 
@@ -153,7 +174,7 @@ class StrategyLayer:
         execution: ExecutionLayer,
         history_size: int = DEFAULT_HISTORY_SIZE,
         binance_symbol: str = "BTCUSDT",
-        binance_interval: str = "1m",
+        binance_interval: str = "1s",
         monitor: Optional[Monitor] = None,
         clock: Callable[[], float] = time.time,
         probability_margin: float = DEFAULT_PROBABILITY_MARGIN,
@@ -161,6 +182,7 @@ class StrategyLayer:
         state_file_path: str = DEFAULT_STATE_FILE_PATH,
         late_join_threshold: float = DEFAULT_LATE_JOIN_THRESHOLD_SECONDS,
         ewma_halflife_seconds: Optional[float] = DEFAULT_EWMA_HALFLIFE_SECONDS,
+        gbm_tick_interval: str = DEFAULT_GBM_TICK_INTERVAL,
     ) -> None:
         self._execution = execution
         self._monitor = monitor or Monitor()
@@ -171,13 +193,11 @@ class StrategyLayer:
         self._history_size = history_size
         self._binance_symbol = binance_symbol
         self._binance_interval = binance_interval
-        self._ewma_halflife_seconds = ewma_halflife_seconds
-        halflife_samples = (
-            ewma_halflife_seconds / _interval_seconds(binance_interval)
-            if ewma_halflife_seconds is not None
-            else None
+        self._ewma_halflife_seconds = ewma_halflife_seconds  # accepted, unused -- see DEFAULT_EWMA_HALFLIFE_SECONDS
+        self._gbm_tick_interval = gbm_tick_interval  # "" -- see DEFAULT_GBM_TICK_INTERVAL
+        self._gbm = GBMEstimator(
+            history_size, tick_interval_seconds=_interval_seconds(gbm_tick_interval or binance_interval)
         )
-        self._gbm = GBMEstimator(history_size, halflife_samples)
         # Both sourced from Chainlink now (_on_chainlink_price) -- Binance
         # klines only drive the GBM estimator these days, see module
         # docstring.
@@ -211,11 +231,13 @@ class StrategyLayer:
 
     async def run(self, events: asyncio.Queue) -> None:
         closes = await fetch_recent_closes(
-            symbol=self._binance_symbol, interval=self._binance_interval, count=self._history_size
+            symbol=self._binance_symbol,
+            interval=self._gbm_tick_interval or self._binance_interval,
+            count=min(self._history_size, MAX_SINGLE_BOOTSTRAP_FETCH),
         )
         self._gbm.seed(closes)
-        logger.info("Bootstrapped %d minutes of BTC price history", len(closes))
-        self._monitor.info(f"Bootstrapped {len(closes)} minutes of BTC price history")
+        logger.info("Bootstrapped %d GBM ticks of BTC price history", len(closes))
+        self._monitor.info(f"Bootstrapped {len(closes)} GBM ticks of BTC price history")
 
         while True:
             event = await events.get()
@@ -300,8 +322,8 @@ class StrategyLayer:
         )
 
     async def _on_binance_kline(self, event: BinanceKlineEvent) -> None:
+        self._gbm.add_price(event.close)
         if event.is_closed:
-            self._gbm.add_close(event.close)
             await self._evaluate()
 
     async def _on_chainlink_price(self, event: ChainlinkPriceEvent) -> None:

@@ -13,6 +13,7 @@ env/
 # Environment / secrets
 .env
 .env.*
+.env_real
 *.pem
 *.key
 
@@ -27,7 +28,7 @@ env/
 Thumbs.db
 
 # Backtest artifacts / large data dumps
-other_src/data/backtest_analysis_30d.json
+other_src/data/
 other_src/backtest_data_*.json
 other_src/backtest_run_data_*.jsonl
 

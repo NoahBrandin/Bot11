@@ -74,5 +74,4 @@ class BinanceFeed:
             volume=float(k["v"]),
             is_closed=bool(k["x"]),
         )
-        if event.is_closed:
-            self._queue.put_nowait(event)
+        self._queue.put_nowait(event)

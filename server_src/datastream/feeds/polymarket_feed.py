@@ -80,11 +80,23 @@ class PolymarketFeed:
         self._asset_outcome.pop(down_token_id, None)
 
     async def _send(self, payload: dict) -> None:
+        # subscribe()/unsubscribe() are called externally (by WindowTracker,
+        # on every window transition), not from within run()'s own
+        # reconnect-loop try/except -- so a send racing a connection that's
+        # mid-drop/reconnect must not propagate, or one transient WS hiccup
+        # at exactly the wrong moment crashes the whole orchestrator (see
+        # git history for the live crash this was found from). Safe to just
+        # drop: subscribe() already updated self._asset_outcome before this
+        # call, so _run_once()'s reconnect re-subscribes to it regardless.
         async with self._ws_lock:
             if self._ws is None:
                 logger.warning("Polymarket WS not connected yet, dropping: %s", payload)
                 return
-            await self._ws.send(json.dumps(payload))
+            try:
+                await self._ws.send(json.dumps(payload))
+            except Exception:
+                logger.warning("Polymarket WS send failed (reconnecting), dropping: %s", payload)
+                self._monitor.error(f"Polymarket WS send failed, dropping: {payload}")
 
     async def run(self) -> None:
         while True:
