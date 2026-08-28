@@ -65,8 +65,6 @@ from execution.live import (
 )
 from execution.live_report import build_status_report, resolve_wallet_address
 from execution.paper import (
-    DEFAULT_SETTLEMENT_MAX_WAIT_SECONDS,
-    DEFAULT_SETTLEMENT_POLL_DELAY_SECONDS,
     DEFAULT_STARTING_BANKROLL,
     DEFAULT_TAKER_FEE_RATE,
 )
@@ -85,7 +83,7 @@ logger = logging.getLogger("orchestrator")
 # mismatched-case) default.
 DEFAULT_BINANCE_SYMBOL = "BTCUSDT"
 DEFAULT_BINANCE_INTERVAL = "1m"
-# Tells gbm.py's two-scale realized-variance estimator (via StrategyLayer's
+# Tells probability_model.py's two-scale realized-variance estimator (via StrategyLayer's
 # gbm_tick_interval) what spacing to assume between the price samples it's
 # fed -- not a separate WS subscription: DatastreamLayer's single BinanceFeed
 # now forwards every kline update (open candles included, not just closes,
@@ -129,8 +127,6 @@ class Config:
     execution_max_position_notional: Optional[float]
     paper_starting_bankroll: float
     paper_taker_fee_rate: float
-    paper_settlement_poll_delay_seconds: float
-    paper_settlement_max_wait_seconds: float
     live_bankroll_cache_seconds: float
     live_price_protection_tolerance: float
     live_max_price_protection_tolerance: float
@@ -194,12 +190,6 @@ def load_config() -> Config:
         ),
         paper_starting_bankroll=env_config.env_float("PAPER_STARTING_BANKROLL", DEFAULT_STARTING_BANKROLL),
         paper_taker_fee_rate=env_config.env_float("PAPER_TAKER_FEE_RATE", DEFAULT_TAKER_FEE_RATE),
-        paper_settlement_poll_delay_seconds=env_config.env_float(
-            "PAPER_SETTLEMENT_POLL_DELAY_SECONDS", DEFAULT_SETTLEMENT_POLL_DELAY_SECONDS
-        ),
-        paper_settlement_max_wait_seconds=env_config.env_float(
-            "PAPER_SETTLEMENT_MAX_WAIT_SECONDS", DEFAULT_SETTLEMENT_MAX_WAIT_SECONDS
-        ),
         live_bankroll_cache_seconds=env_config.env_float(
             "LIVE_BANKROLL_CACHE_SECONDS", DEFAULT_BANKROLL_CACHE_SECONDS
         ),
@@ -265,9 +255,6 @@ def _build_execution_layer(config: Config, monitor: Monitor) -> ExecutionLayer:
             max_position_notional=config.execution_max_position_notional,
             starting_bankroll=config.paper_starting_bankroll,
             taker_fee_rate=config.paper_taker_fee_rate,
-            window_seconds=config.window_seconds,
-            settlement_poll_delay_seconds=config.paper_settlement_poll_delay_seconds,
-            settlement_max_wait_seconds=config.paper_settlement_max_wait_seconds,
         )
     if mode == "live":
         logger.warning("LIVE TRADING ENABLED -- REAL MONEY AT RISK")

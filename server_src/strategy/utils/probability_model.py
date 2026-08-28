@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Deque, List, Optional, Sequence
+from typing import Deque, List, Optional, Sequence, Tuple
 
 
 class RealizedVarianceEstimator:
@@ -135,7 +135,7 @@ class TwoScaleRealizedVariance:
 
 class GBMEstimator:
     """Wraps TwoScaleRealizedVariance with the time-unit bookkeeping needed
-    to expose a per-minute sigma, matching gbm.py's GBMEstimator.sigma
+    to expose a per-minute sigma, matching probability_model.py's GBMEstimator.sigma
     convention.
 
     `history_size` is in ticks (at `tick_interval_seconds` spacing), not
@@ -199,7 +199,7 @@ class GBMEstimator:
         calendar length T, not on tick count -- unlike sigma, more/faster
         ticks buy nothing here, so there's no version of this estimator that
         high-frequency data would fix. Checked against today's live paper-run
-        log (server_src/log.jsonl, 194 readings of gbm.py's actual live mu/
+        log (server_src/log.jsonl, 194 readings of probability_model.py's actual live mu/
         sigma): median |mu|/sigma was 1.14, with |mu| > sigma in 53.6% of
         readings -- a real drift that large relative to sigma at this
         calibration window would be extraordinary; estimation noise dominating
@@ -208,6 +208,35 @@ class GBMEstimator:
         roughly sigma's own ratio times sqrt(minutes_remaining) -- ~2.5x at a
         5-minute horizon and the observed median ratio."""
         return 0.0
+
+
+class RecentTickBuffer:
+    """Rolling (timestamp, price) buffer of raw ticks, retained for
+    max_age_seconds -- feeds settlement_probability_up()'s known/unknown
+    window split below. Distinct from probability_model.py's GBMEstimator, which only
+    needs the returns between consecutive ticks, not their absolute
+    timestamps or a bounded-recency window of the raw values themselves."""
+
+    def __init__(self, max_age_seconds: float) -> None:
+        self._max_age_seconds = max_age_seconds
+        self._ticks: Deque[Tuple[float, float]] = deque()
+
+    def add(self, timestamp: float, price: float) -> None:
+        self._ticks.append((timestamp, price))
+        cutoff = timestamp - self._max_age_seconds
+        while self._ticks and self._ticks[0][0] < cutoff:
+            self._ticks.popleft()
+
+    def average_since(self, since_timestamp: float) -> Optional[float]:
+        """Mean price of retained ticks with timestamp >= since_timestamp --
+        None if there aren't any (buffer not warmed up, or since_timestamp
+        is more recent than every tick seen so far)."""
+        values = [p for t, p in self._ticks if t >= since_timestamp]
+        return (sum(values) / len(values)) if values else None
+
+    @property
+    def latest_price(self) -> Optional[float]:
+        return self._ticks[-1][1] if self._ticks else None
 
 
 def probability_up(
@@ -225,12 +254,31 @@ def probability_up(
     Chainlink TWAP -- an earlier version corrected for that (see git
     history, _twap_adjusted_horizon), removed after live paper-run
     calibration data showed it made the model more overconfident, not less
-    (see git log for the run details)."""
-    if minutes_remaining <= 0:
+    (see git log for the run details). settlement_probability_up() below is
+    a different, narrower correction for the same underlying fact -- see its
+    docstring for why this one wasn't judged to have the same problem."""
+    return _probability_above(current_price, reference_price, minutes_remaining, minutes_remaining, mu, sigma)
+
+
+def _probability_above(
+    current_price: float,
+    reference_price: float,
+    drift_time: float,
+    var_time: float,
+    mu: float,
+    sigma: float,
+) -> float:
+    """Shared core: P(a lognormal step from current_price, applying drift
+    over drift_time and vol over var_time, lands >= reference_price).
+    probability_up() is the drift_time == var_time == minutes_remaining
+    case (a point value at T); settlement_probability_up() below calls this
+    with the two split apart (a path average over T has a smaller effective
+    var_time than drift_time, or than a point value's T == T)."""
+    if var_time <= 0:
         return 1.0 if current_price >= reference_price else 0.0
 
-    drift_term = math.log(current_price / reference_price) + (mu - 0.5 * sigma**2) * minutes_remaining
-    vol_term = sigma * math.sqrt(minutes_remaining)
+    drift_term = math.log(current_price / reference_price) + (mu - 0.5 * sigma**2) * drift_time
+    vol_term = sigma * math.sqrt(var_time)
 
     if vol_term == 0:
         return 1.0 if drift_term >= 0 else 0.0
@@ -240,3 +288,74 @@ def probability_up(
 
 def _standard_normal_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+
+def settlement_probability_up(
+    live_price: float,
+    reference_price: float,
+    minutes_remaining: float,
+    mu: float,
+    sigma: float,
+    twap_window_seconds: float,
+    known_average: Optional[float] = None,
+    known_seconds: float = 0.0,
+) -> float:
+    """P(settlement TWAP >= reference_price) -- unlike probability_up(),
+    accounts for Polymarket settling against a trailing twap_window_seconds
+    average, not a point value, by splitting that average into its already-
+    realized and still-stochastic parts once minutes_remaining is inside the
+    window:
+
+        TWAP = (known_seconds/W)*known_average + (unknown_seconds/W)*A
+
+    where W = twap_window_seconds, unknown_seconds = minutes_remaining*60,
+    known_average is the mean of the raw ticks already observed over the
+    portion of the trailing window that's already elapsed (from
+    RecentTickBuffer -- the raw feed, NOT the Chainlink TWAP stream, which
+    is already smoothed and isn't the underlying process being modeled
+    here), and A is the still-unknown average of the GBM path over the
+    remaining unknown_seconds. Solving TWAP >= reference_price for A reduces
+    to probability_up() against an adjusted reference price -- except A is a
+    path *average*, not a terminal point value, so its effective drift/vol
+    time isn't just unknown_seconds: drift accrues over roughly half that
+    remaining time on average and its variance is a third of a point
+    value's over the same span (Var[(1/T)int W_s ds] = T/3 for Brownian
+    motion) -- the same style of approximation probability_model.py's earlier
+    _twap_adjusted_horizon used for its own t<w case (see git history),
+    reused here rather than the exact (much messier) Kemna/Vorst
+    arithmetic-Asian moment formula.
+
+    Falls back to plain probability_up() (against live_price, the raw tick
+    price, not a TWAP snapshot) whenever the whole trailing window is still
+    in the future (minutes_remaining*60 >= twap_window_seconds) or no
+    known_average is available yet (RecentTickBuffer not warmed up) -- in
+    both cases there's no known/unknown split to make yet.
+
+    Unlike the old _twap_adjusted_horizon (a probability_up() docstring note
+    says removed for being empirically overconfident), this only ever
+    activates in the last twap_window_seconds of a window, and pins its
+    known component to observed ticks instead of an analytic approximation
+    over the whole remaining time -- untested against live/backtest
+    calibration data itself, so treat that history as a reason to check
+    calibration again before trusting this live, not as a reason it's
+    already fine."""
+    unknown_seconds = minutes_remaining * 60.0
+    if unknown_seconds >= twap_window_seconds or known_average is None or known_seconds <= 0 or twap_window_seconds <= 0:
+        return probability_up(live_price, reference_price, minutes_remaining, mu, sigma)
+
+    known_weight = known_seconds / twap_window_seconds
+    unknown_weight = unknown_seconds / twap_window_seconds
+
+    if unknown_weight <= 0:
+        settlement = known_weight * known_average
+        return 1.0 if settlement >= reference_price else 0.0
+
+    effective_reference = (reference_price - known_weight * known_average) / unknown_weight
+    if effective_reference <= 0:
+        # known_average alone already clears reference_price -- A (a price
+        # average) can't be negative, so settlement is guaranteed >= it.
+        return 1.0
+
+    unknown_minutes = unknown_seconds / 60.0
+    drift_time = unknown_minutes / 2.0
+    var_time = unknown_minutes / 3.0
+    return _probability_above(live_price, effective_reference, drift_time, var_time, mu, sigma)

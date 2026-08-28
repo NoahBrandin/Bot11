@@ -3,10 +3,11 @@ documented crypto-category taker fee applied on every fill, no slippage
 modeled, in-memory bankroll and positions.
 
 Unlike live trading, a paper position still held when its window closes
-never settles on-chain -- nothing credits its $0/$1 payout unless something
-here does it. on_window_close() polls Gamma for the window's resolved payout
-and settles any residual position, so paper PnL run live against real market
-data stays trustworthy even when the strategy fails to exit before expiry.
+never settles on-chain -- nothing credits its $0/$1 payout here. This layer
+does not poll Gamma for resolution itself (on_window_close is base's no-op);
+other_src/paper_run_review.py re-derives every position's true settlement
+straight from Gamma after the fact instead, so there's no need to block a
+live run waiting on-chain resolution to show up.
 """
 from __future__ import annotations
 
@@ -15,10 +16,7 @@ import logging
 import time
 from typing import Callable, Optional
 
-import aiohttp
-
 from datastream.utils.events import Side
-from datastream.utils.gamma_client import DEFAULT_WINDOW_SECONDS, GammaClient
 from monitoring import Monitor
 
 from .base import (
@@ -42,13 +40,6 @@ DEFAULT_STARTING_BANKROLL = 1000.0
 # fee'd.
 DEFAULT_TAKER_FEE_RATE = 0.07
 
-# A window's real resolution isn't necessarily available the instant it
-# closes -- Gamma needs to observe/settle it first. Poll rather than assume
-# it's immediate, same retry-with-delay shape as WindowTracker's own market
-# fetch, but capped so a Gamma hiccup can't hang a settlement task forever.
-DEFAULT_SETTLEMENT_POLL_DELAY_SECONDS = 2.0
-DEFAULT_SETTLEMENT_MAX_WAIT_SECONDS = 60.0
-
 
 class PaperExecutionLayer(ExecutionLayer):
     def __init__(
@@ -60,10 +51,6 @@ class PaperExecutionLayer(ExecutionLayer):
         starting_bankroll: float = DEFAULT_STARTING_BANKROLL,
         taker_fee_rate: float = DEFAULT_TAKER_FEE_RATE,
         clock: Callable[[], float] = time.time,
-        session: Optional[aiohttp.ClientSession] = None,
-        window_seconds: float = DEFAULT_WINDOW_SECONDS,
-        settlement_poll_delay_seconds: float = DEFAULT_SETTLEMENT_POLL_DELAY_SECONDS,
-        settlement_max_wait_seconds: float = DEFAULT_SETTLEMENT_MAX_WAIT_SECONDS,
     ) -> None:
         super().__init__(
             monitor=monitor,
@@ -84,15 +71,6 @@ class PaperExecutionLayer(ExecutionLayer):
         self._settle_count = 0
         self._settled_value = 0.0
         self._total_fees = 0.0
-
-        self._session = session
-        self._gamma: Optional[GammaClient] = None
-        self._window_seconds = window_seconds
-        self._settlement_poll_delay_seconds = settlement_poll_delay_seconds
-        self._settlement_max_wait_seconds = settlement_max_wait_seconds
-        # Held so settlement tasks aren't garbage-collected mid-flight and so
-        # a slow/never-resolving one is at least visible, not silently lost.
-        self._settlement_tasks: set = set()
 
     async def _get_bankroll(self) -> float:
         async with self._lock:
@@ -145,64 +123,6 @@ class PaperExecutionLayer(ExecutionLayer):
                 self._settle_count += 1
                 self._settled_value += payout
             return payout
-
-    async def on_window_close(self, slug: str) -> None:
-        task = asyncio.create_task(self._settle_window(slug))
-        self._settlement_tasks.add(task)
-        task.add_done_callback(self._settlement_tasks.discard)
-
-    async def _settle_window(self, slug: str) -> None:
-        gamma = await self._ensure_gamma()
-        deadline = self._clock() + self._settlement_max_wait_seconds
-        while True:
-            market = None
-            try:
-                market = await gamma.fetch_window_market(slug)
-            except Exception:
-                logger.exception("Failed fetching resolution for %s", slug)
-                self._monitor.error(f"Failed fetching resolution for {slug}")
-
-            # market.up_payout/down_payout come straight from Gamma's
-            # outcomePrices, which is populated for an actively-trading
-            # market too (the current traded price, not yet a $0/$1
-            # payout) -- without the closed check this settles at whatever
-            # noisy interim price the first poll (2s after window close)
-            # happens to catch, well before the oracle actually resolves.
-            if market is not None and market.closed and market.up_payout is not None and market.down_payout is not None:
-                up_paid = await self.settle(market.up_token_id, market.up_payout)
-                down_paid = await self.settle(market.down_token_id, market.down_payout)
-                if up_paid or down_paid:
-                    logger.info(
-                        "Settled %s: up=%.4f down=%.4f", slug, up_paid, down_paid,
-                        extra={
-                            "event": "settlement",
-                            "slug": slug,
-                            "up_token_id": market.up_token_id,
-                            "down_token_id": market.down_token_id,
-                            "up_payout": market.up_payout,
-                            "down_payout": market.down_payout,
-                            "up_paid": up_paid,
-                            "down_paid": down_paid,
-                        },
-                    )
-                    self._monitor.execution(f"Settled {slug}: up={up_paid:.4f} down={down_paid:.4f}")
-                return
-
-            if self._clock() >= deadline:
-                logger.error("Giving up waiting for %s to resolve after %.0fs", slug, self._settlement_max_wait_seconds)
-                self._monitor.error(
-                    f"Giving up waiting for {slug} to resolve -- any residual position is unsettled in the paper book"
-                )
-                return
-
-            await asyncio.sleep(self._settlement_poll_delay_seconds)
-
-    async def _ensure_gamma(self) -> GammaClient:
-        if self._gamma is None:
-            if self._session is None:
-                self._session = aiohttp.ClientSession()
-            self._gamma = GammaClient(self._session, window_seconds=self._window_seconds)
-        return self._gamma
 
     def log_stats(self) -> None:
         """Logs a summary of paper-trading activity; call once the run is

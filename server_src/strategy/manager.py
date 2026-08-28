@@ -67,7 +67,7 @@ from execution.base import ExecutionLayer
 from monitoring import Monitor
 
 from strategy.utils.binance_history import fetch_recent_closes
-from strategy.utils.gbm import GBMEstimator, probability_up
+from strategy.utils.probability_model import GBMEstimator, RecentTickBuffer, settlement_probability_up
 from strategy.utils.kelly import DEFAULT_KELLY_MULTIPLIER, kelly_fraction
 from .signal import Signal
 
@@ -105,17 +105,17 @@ DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # tick-to-tick noise; this default needs empirical tuning (e.g. a paper-mode
 # observation run) before being trusted live.
 DEFAULT_PROBABILITY_MARGIN = 0.02
-# No longer consumed: gbm.py's GBMEstimator was EWMA-based (this picked its
+# No longer consumed: probability_model.py's GBMEstimator was EWMA-based (this picked its
 # recency-weighting halflife, validated by a 2026-08-22 backtest sweep) until
 # it was replaced by a two-scale-realized-variance estimator with mu fixed at
-# 0 (martingale assumption) -- see gbm.py's module docstring. Kept as a
+# 0 (martingale assumption) -- see probability_model.py's module docstring. Kept as a
 # StrategyLayer.__init__ parameter/Config field rather than removed outright,
 # since ripping it out would ripple into orchestrator.py/config.py for no
 # behavioral gain; ewma_halflife_seconds is accepted but ignored below.
 DEFAULT_EWMA_HALFLIFE_SECONDS: Optional[float] = 30.0
 # Disabled by default -- see StrategyLayer._state_file_path.
 DEFAULT_STATE_FILE_PATH = ""
-# Tells gbm.py's GBMEstimator what spacing to assume between the price
+# Tells probability_model.py's GBMEstimator what spacing to assume between the price
 # samples _on_binance_kline feeds it -- not a separate feed subscription;
 # DatastreamLayer's single BinanceFeed forwards every kline update (open
 # candles included, see binance_feed.py) at whatever interval it's
@@ -124,6 +124,8 @@ DEFAULT_STATE_FILE_PATH = ""
 # binance_interval's own spacing instead -- what
 # other_src/backtest/engine.py gets, since it never passes this.
 DEFAULT_GBM_TICK_INTERVAL = ""
+# See StrategyLayer._recent_ticks / probability_model.py's settlement_probability_up.
+DEFAULT_TICK_BUFFER_SECONDS = 90.0
 
 _INTERVAL_SECONDS = {"1s": 1.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
 
@@ -195,14 +197,23 @@ class StrategyLayer:
         self._gbm = GBMEstimator(
             history_size, tick_interval_seconds=_interval_seconds(gbm_tick_interval or binance_interval)
         )
-        # Both sourced from Chainlink now (_on_chainlink_price) -- Binance
-        # klines only drive the GBM estimator these days, see module
+        # Raw Binance ticks (the same ones fed to self._gbm), retained with
+        # timestamps -- settlement_probability_up's known/unknown TWAP-window
+        # split (see probability_model.py) needs the actual observed prices over the
+        # already-elapsed portion of the trailing settlement window, not just
+        # their returns. DEFAULT_TICK_BUFFER_SECONDS covers the Chainlink
+        # window (60s) plus slack for clock jitter; bump it if
+        # chainlink_window_seconds is ever configured larger than that.
+        self._recent_ticks = RecentTickBuffer(DEFAULT_TICK_BUFFER_SECONDS)
+        # current_price/target_price sourced from Chainlink
+        # (_on_chainlink_price) -- Binance klines drive the GBM estimator and
+        # (via self._recent_ticks) the settlement-window split, see module
         # docstring.
         self._current_price: Optional[float] = None
         self._current_price_timestamp: Optional[float] = None
         # The Chainlink TWAP's own averaging window (seconds), from the most
-        # recent ChainlinkPriceEvent -- fed into probability_up's TWAP
-        # variance correction (see gbm.py). None until the first tick
+        # recent ChainlinkPriceEvent -- fed into settlement_probability_up's
+        # known/unknown split (see probability_model.py). None until the first tick
         # arrives, same as _current_price.
         self._chainlink_window_seconds: Optional[float] = None
         self._late_join_threshold = late_join_threshold
@@ -227,10 +238,20 @@ class StrategyLayer:
         self._paused = False
 
     async def run(self, events: asyncio.Queue) -> None:
+        # +subsample_k, not just +1: GBMEstimator.ready needs history_size
+        # *returns*, which takes history_size+1 *prices* (N prices yield only
+        # N-1 log-returns) -- and TwoScaleRealizedVariance's slow subgrids
+        # each need their own full share of returns too, round-robined one
+        # tick at a time across subsample_k of them. Seeding only
+        # history_size+1 prices fills every subgrid but one to just short of
+        # ready, so live ticks would otherwise have to trickle in for up to
+        # subsample_k*tick_interval_seconds (~2 minutes at the 1s/120 default)
+        # after every restart before the last subgrid catches up and trading
+        # can resume -- exactly the "GBM not ready" gap seen after a restart.
         closes = await fetch_recent_closes(
             symbol=self._binance_symbol,
             interval=self._gbm_tick_interval or self._binance_interval,
-            count=self._history_size,
+            count=self._history_size + self._gbm.subsample_k,
         )
         self._gbm.seed(closes)
         logger.info("Bootstrapped %d GBM ticks of BTC price history", len(closes))
@@ -324,6 +345,7 @@ class StrategyLayer:
 
     async def _on_binance_kline(self, event: BinanceKlineEvent) -> None:
         self._gbm.add_price(event.close)
+        self._recent_ticks.add(self._clock(), event.close)
         if event.is_closed:
             await self._evaluate()
 
@@ -337,18 +359,6 @@ class StrategyLayer:
         if self._window is None or event.slug != self._window.slug:
             return
         self._update_quote(event.outcome, event.best_bid, event.best_ask)
-        # Re-evaluate on every quote tick, not just once per Binance candle
-        # close: probability itself only moves on a real BTC/vol update, but
-        # frozen_price (the actual order price -- see _evaluate_outcome's
-        # "track" branch) was only ever refreshed on that same once-a-minute
-        # cadence, even though Polymarket's book can gap in a fraction of
-        # that time. Polymarket's own execution guidance is to "recalculate
-        # price estimates immediately before submission" -- this is that,
-        # using data already sitting in memory (no extra network call, no
-        # added latency). _evaluate() is cheap (closed-form probability calc)
-        # and converge() is idempotent/cooldown-gated, so evaluating more
-        # often costs nothing beyond a slightly fresher price.
-        await self._evaluate()
 
 #   --- Evaluation ---
     async def _evaluate(self) -> None:
@@ -367,11 +377,27 @@ class StrategyLayer:
             return
 
         mu, sigma = self._gbm.mu, self._gbm.sigma
-        # No longer fed into probability_up() -- see its docstring -- but
-        # still carried onto Signal purely as logging context (which
-        # Chainlink TWAP window was active for this decision).
-        twap_window_minutes = (self._chainlink_window_seconds or 0.0) / 60.0
-        p_up = probability_up(self._current_price, window.target_price, minutes_remaining, mu, sigma)
+        twap_window_seconds = self._chainlink_window_seconds or 0.0
+        twap_window_minutes = twap_window_seconds / 60.0
+        # Known/unknown settlement-window split (see probability_model.py's
+        # settlement_probability_up) -- known_seconds is how much of the
+        # trailing twap_window_seconds settlement average is already
+        # observed at `now`; 0 (i.e. no split, plain probability_up
+        # fallback) whenever minutes_remaining still exceeds a full window.
+        now = self._clock()
+        known_seconds = max(twap_window_seconds - minutes_remaining * 60.0, 0.0)
+        known_average = self._recent_ticks.average_since(now - known_seconds) if known_seconds > 0 else None
+        # The raw tick price, not self._current_price (a Chainlink TWAP
+        # snapshot) -- the still-stochastic remainder of the settlement
+        # window evolves from the actual instantaneous price, and its
+        # spread from the (smoothed, lagging) TWAP is exactly the
+        # deterministic pull the known/unknown split already captures via
+        # known_average, so no separate drift term is needed for it.
+        live_price = self._recent_ticks.latest_price or self._current_price
+        p_up = settlement_probability_up(
+            live_price, window.target_price, minutes_remaining, mu, sigma,
+            twap_window_seconds, known_average, known_seconds,
+        )
         probabilities = {Outcome.UP: p_up, Outcome.DOWN: 1.0 - p_up}
 
         for outcome, probability in probabilities.items():

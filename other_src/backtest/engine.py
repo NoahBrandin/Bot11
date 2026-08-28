@@ -130,26 +130,17 @@ async def run_backtest(
         price_protection_tolerance=price_protection_tolerance,
         spread_half_width=spread_half_width,
     )
-    # StrategyLayer.handle_event() calls execution.on_window_close() on every
-    # WindowCloseEvent, which for the real PaperExecutionLayer polls the live
-    # Gamma API to resolve the window before settling -- needed for a live
-    # paper-mode dry run, but wrong here: this loop already knows every
-    # window's real resolved outcome from the downloaded data and settles it
-    # directly below with execution.settle(...). Left wired up, replaying
-    # ~hundreds of windows would fire that many unthrottled live network
-    # calls into an otherwise fully offline, deterministic replay. No-op it
-    # for the backtest only; production paper-mode is unaffected.
-    async def _no_network_settlement(slug: str) -> None:
-        return None
-
-    execution.on_window_close = _no_network_settlement
+    # This loop already knows every window's real resolved outcome from the
+    # downloaded data and settles it directly below with execution.settle(...);
+    # PaperExecutionLayer.on_window_close() is a no-op (see execution/paper.py),
+    # so there's nothing to override here.
 
     strategy = StrategyLayer(
         execution=execution,
         clock=clock,
         ewma_halflife_seconds=ewma_halflife_seconds,
         # Matches orchestrator.py's live default whenever this data file has
-        # ticks to actually back it up -- gbm.py's GBMEstimator needs to know
+        # ticks to actually back it up -- probability_model.py's GBMEstimator needs to know
         # 1s (not the 1m klines') spacing, or its two-scale correction's
         # subsample grids are calibrated against the wrong sample count.
         # "" (old default) for tick-less files falls back to binance_interval
@@ -229,7 +220,7 @@ async def run_backtest(
     # regardless") -- there is no pre-window tick data to seed from. Seeding
     # from klines instead (1m-spaced) while gbm_tick_interval="1s" assumes 1s
     # spacing would misconfigure TwoScaleRealizedVariance's subsample grids
-    # (see gbm.py), so ticked backtests skip pre-fill and self-warm from the
+    # (see probability_model.py), so ticked backtests skip pre-fill and self-warm from the
     # replay stream instead -- history_size=6000 at ~300 ticks/5-min window
     # means roughly the first 20 windows run un-ready (no trading) before
     # gbm.ready flips true, a small fraction of any multi-day backtest.
@@ -423,7 +414,7 @@ def _make_kline_event(k: dict) -> BinanceKlineEvent:
 
 def _make_tick_event(t: dict) -> BinanceKlineEvent:
     # is_closed=False, unlike _make_kline_event's 1m events -- these feed
-    # gbm.py's GBMEstimator (via StrategyLayer._on_binance_kline's unconditional
+    # probability_model.py's GBMEstimator (via StrategyLayer._on_binance_kline's unconditional
     # add_price) without also triggering _evaluate() on every second, mirroring
     # how live's single BinanceFeed now forwards intra-candle kline pushes
     # (binance_feed.py no longer filters on is_closed) while only the actual
