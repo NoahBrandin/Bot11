@@ -22,6 +22,7 @@ env/
 
 # Logs
 *.log
+*.jsonl
 
 # OS
 .DS_Store

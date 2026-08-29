@@ -1,0 +1,20 @@
+# Triggers bot11-log-upload.service every 10 minutes -- a periodic timer
+# instead of a file watcher since RotatingFileHandler's rollover is
+# size-triggered, not time-triggered, so there's no fixed moment to hook
+# into anyway. See bot11-log-upload.service for the one-time rclone setup.
+#
+# Install alongside bot11-log-upload.service:
+#   sudo cp deploy/bot11-log-upload.service deploy/bot11-log-upload.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bot11-log-upload.timer
+
+[Unit]
+Description=Periodic trigger for bot11-log-upload.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

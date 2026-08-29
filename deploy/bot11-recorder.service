@@ -1,0 +1,66 @@
+# systemd unit for the Bot11 datastream recorder (server_src/utils/record_datastream.py).
+#
+# Runs independently of bot11.service (deploy/bot11.service): a crash or
+# restart of the trading orchestrator doesn't stop tick recording, and vice
+# versa. Uses the same server_src/.env for its DatastreamLayer settings
+# (BINANCE_SYMBOL, CHAINLINK_SYMBOL, etc.) but writes to its own log file.
+#
+# Install:
+#   sudo cp deploy/bot11-recorder.service /etc/systemd/system/bot11-recorder.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bot11-recorder
+#
+# Logs:
+#   journalctl -u bot11-recorder -f
+#   Also written as JSON Lines to a rotating file at
+#   $LOGS_DIRECTORY/datastream.jsonl (50MB x 10 backups) -- see LogsDirectory=
+#   below and record_datastream.py::_configure_logging(). Override the path
+#   with DATASTREAM_LOG_FILE_PATH in .env, or set it to an empty string to
+#   disable the file and keep stdout/journal-only.
+#   See deploy/bot11-log-upload.service/.timer for shipping finished
+#   (rotated) segments off-box to Google Drive.
+#
+# Before enabling, adjust the paths/user below to match the server, and
+# confirm server_src/.env exists there -- WorkingDirectory must stay pointed
+# at server_src for load_dotenv() to find it automatically.
+
+[Unit]
+Description=Bot11 Polymarket/Binance live data recorder
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=bot11
+Group=bot11
+WorkingDirectory=/opt/bot11/server_src
+ExecStart=/opt/bot11/.venv/bin/python utils/record_datastream.py
+Environment=PYTHONUNBUFFERED=1
+
+# Same writable LogsDirectory= as bot11.service -- both units share
+# /var/log/bot11 but write to different files within it (bot11.jsonl vs
+# datastream.jsonl), so no conflict.
+LogsDirectory=bot11
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening -- same rationale as bot11.service: only needs outbound
+# network, its own venv/source tree read-only, and the one writable
+# LogsDirectory= path.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bot11-recorder
+
+[Install]
+WantedBy=multi-user.target

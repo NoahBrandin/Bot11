@@ -1,0 +1,52 @@
+# systemd oneshot unit that ships finished (rotated) Bot11 log segments to
+# Google Drive via rclone, then deletes them locally (rclone move). Triggered
+# on a schedule by deploy/bot11-log-upload.timer -- see that file to install.
+#
+# Only rotated segments (datastream.jsonl.1, bot11.jsonl.2, ...) are matched,
+# never the active *.jsonl file still being appended to by bot11.service /
+# bot11-recorder.service -- RotatingFileHandler only creates/touches a
+# ".N" file at the moment of rollover, at which point it's immutable.
+#
+# One-time setup before enabling:
+#   1. Install rclone: https://rclone.org/install/
+#   2. Authorize your Google account:
+#        rclone config
+#      (create a remote named "gdrive", type "drive"; if the server has no
+#      browser, run `rclone authorize "drive"` on your PC instead and paste
+#      the resulting token when rclone config asks for it on the server)
+#   3. Create the destination folder in your Drive (e.g. "bot11-logs") and
+#      share it ("Anyone with the link") if you want it publicly viewable.
+#   4. Copy the resulting config to a location this service can read:
+#        sudo mkdir -p /etc/bot11
+#        sudo cp ~/.config/rclone/rclone.conf /etc/bot11/rclone.conf
+#        sudo chown -R bot11:bot11 /etc/bot11
+#
+# Install the unit + timer:
+#   sudo cp deploy/bot11-log-upload.service deploy/bot11-log-upload.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bot11-log-upload.timer
+#
+# Test manually any time with: sudo systemctl start bot11-log-upload.service
+
+[Unit]
+Description=Upload finished Bot11 log segments to Google Drive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bot11
+Group=bot11
+ExecStart=/usr/bin/rclone move /var/log/bot11 gdrive:bot11-logs \
+    --config /etc/bot11/rclone.conf \
+    --include "datastream.jsonl.*" \
+    --include "bot11.jsonl.*" \
+    --min-age 30s
+
+# Only needs to read/delete inside the LogsDirectory both other units write
+# to, plus outbound network for the upload itself.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/bot11
+PrivateTmp=true
