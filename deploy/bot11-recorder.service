@@ -36,7 +36,7 @@ Type=simple
 User=bot11
 Group=bot11
 WorkingDirectory=/opt/bot11/server_src
-ExecStart=/opt/bot11/.venv/bin/python utils/record_datastream.py
+ExecStart=/opt/bot11/.venv/bin/python -m utils.record_datastream
 Environment=PYTHONUNBUFFERED=1
 
 # Same writable LogsDirectory= as bot11.service -- both units share

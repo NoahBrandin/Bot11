@@ -17,7 +17,13 @@ larger rotation limits, since tick volume is far higher than order/strategy
 events. See deploy/bot11-log-upload.service/.timer for shipping finished
 (rotated) segments off-box to Google Drive via rclone.
 
-    python record_datastream.py
+Run as a module (not as a bare script) so sys.path picks up server_src's
+sibling packages (datastream, utils) the same way orchestrator.py gets them
+for free by living directly in server_src -- record_datastream.py sits one
+level down, in utils/, so `python utils/record_datastream.py` would only put
+utils/ itself on sys.path and fail with "No module named 'datastream'":
+
+    cd server_src && python -m utils.record_datastream
 """
 from __future__ import annotations
 
