@@ -67,7 +67,19 @@ from execution.base import ExecutionLayer
 from monitoring import Monitor
 
 from strategy.utils.binance_history import fetch_recent_closes
-from strategy.utils.probability_model import GBMEstimator, RecentTickBuffer, settlement_probability_up
+from strategy.utils.probability_model import (
+    DEFAULT_MOMENTUM_SHRINKAGE,
+    DEFAULT_MOMENTUM_WINDOW_SECONDS,
+    DEFAULT_MOMENTUM_Z_CAP,
+    DEFAULT_REVERSION_SHRINKAGE,
+    DEFAULT_REVERSION_WINDOW_SECONDS,
+    DEFAULT_REVERSION_Z_CAP,
+    GBMEstimator,
+    RecentTickBuffer,
+    momentum_mu,
+    reversion_mu,
+    settlement_probability_up,
+)
 from strategy.utils.kelly import DEFAULT_KELLY_MULTIPLIER, kelly_fraction
 from .signal import Signal
 
@@ -97,21 +109,25 @@ DEFAULT_HISTORY_SIZE = 6000
 # state (see _on_window_open) -- that's the exact true window_start price,
 # captured before the restart, so a late rejoin has no reason to distrust it.
 DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
-# Half-width of the dead zone around p=0.5: enter an outcome once its
-# modeled probability clears 0.5 + margin, exit once it drops to 0.5 -
-# margin. This symmetric band -- not a single shared threshold -- is what
-# absorbs tick-to-tick probability noise without needing a time-based
-# debounce. The right width depends on the GBM estimator's actual
-# tick-to-tick noise; this default needs empirical tuning (e.g. a paper-mode
-# observation run) before being trusted live.
-DEFAULT_PROBABILITY_MARGIN = 0.02
+# Required probability edge over the actual transactable price: enter once
+# probability clears quote.ask + margin (the price actually paid), exit once
+# it drops to (bid, or ask if the book's bid side is empty) - margin (the
+# price actually received). Anchoring to the live quote rather than a fixed
+# p=0.5 line is what makes this a real minimum-edge requirement regardless
+# of how far the market's own price sits from a coin flip -- a fixed 0.5-
+# anchored band only constrains edge when the quote happens to be near 0.5,
+# and otherwise either demands an oversized edge (quote far below 0.5) or
+# next to none (quote far above 0.5). The right width still depends on the
+# GBM estimator's actual tick-to-tick noise; this default needs empirical
+# tuning (e.g. a paper-mode observation run) before being trusted live.
+DEFAULT_PROBABILITY_MARGIN = 0.07
 # No longer consumed: probability_model.py's GBMEstimator was EWMA-based (this picked its
 # recency-weighting halflife, validated by a 2026-08-22 backtest sweep) until
-# it was replaced by a two-scale-realized-variance estimator with mu fixed at
-# 0 (martingale assumption) -- see probability_model.py's module docstring. Kept as a
-# StrategyLayer.__init__ parameter/Config field rather than removed outright,
-# since ripping it out would ripple into orchestrator.py/config.py for no
-# behavioral gain; ewma_halflife_seconds is accepted but ignored below.
+# it was replaced by a two-scale-realized-variance estimator -- see
+# probability_model.py's module docstring. Kept as a StrategyLayer.__init__
+# parameter/Config field rather than removed outright, since ripping it out
+# would ripple into orchestrator.py/config.py for no behavioral gain;
+# ewma_halflife_seconds is accepted but ignored below.
 DEFAULT_EWMA_HALFLIFE_SECONDS: Optional[float] = 30.0
 # Disabled by default -- see StrategyLayer._state_file_path.
 DEFAULT_STATE_FILE_PATH = ""
@@ -126,6 +142,14 @@ DEFAULT_STATE_FILE_PATH = ""
 DEFAULT_GBM_TICK_INTERVAL = ""
 # See StrategyLayer._recent_ticks / probability_model.py's settlement_probability_up.
 DEFAULT_TICK_BUFFER_SECONDS = 90.0
+# See StrategyLayer._reversion_ticks / probability_model.py's reversion_mu().
+# Sized off the *configured* reversion_window_seconds (unlike
+# DEFAULT_TICK_BUFFER_SECONDS's fixed 90s) since that window can be far
+# longer -- reversion_mu() needs the full trailing window covered, plus a
+# little slack for clock jitter, or it silently falls back to mu=0.0 forever
+# (same class of bug as momentum_window_seconds vs the 90s buffer would hit
+# above ~45s -- see the code-review finding this was written to avoid).
+DEFAULT_REVERSION_BUFFER_SLACK_SECONDS = 30.0
 
 _INTERVAL_SECONDS = {"1s": 1.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
 
@@ -182,13 +206,24 @@ class StrategyLayer:
         late_join_threshold: float = DEFAULT_LATE_JOIN_THRESHOLD_SECONDS,
         ewma_halflife_seconds: Optional[float] = DEFAULT_EWMA_HALFLIFE_SECONDS,
         gbm_tick_interval: str = DEFAULT_GBM_TICK_INTERVAL,
+        momentum_window_seconds: float = DEFAULT_MOMENTUM_WINDOW_SECONDS,
+        momentum_z_cap: float = DEFAULT_MOMENTUM_Z_CAP,
+        momentum_shrinkage: float = DEFAULT_MOMENTUM_SHRINKAGE,
+        reversion_window_seconds: float = DEFAULT_REVERSION_WINDOW_SECONDS,
+        reversion_z_cap: float = DEFAULT_REVERSION_Z_CAP,
+        reversion_shrinkage: float = DEFAULT_REVERSION_SHRINKAGE,
     ) -> None:
         self._execution = execution
         self._monitor = monitor or Monitor()
         self._clock = clock
-        self._entry_line = 0.5 + probability_margin
-        self._exit_line = 0.5 - probability_margin
+        self._probability_margin = probability_margin
         self._kelly_multiplier = kelly_multiplier
+        self._momentum_window_seconds = momentum_window_seconds
+        self._momentum_z_cap = momentum_z_cap
+        self._momentum_shrinkage = momentum_shrinkage
+        self._reversion_window_seconds = reversion_window_seconds
+        self._reversion_z_cap = reversion_z_cap
+        self._reversion_shrinkage = reversion_shrinkage
         self._history_size = history_size
         self._binance_symbol = binance_symbol
         self._binance_interval = binance_interval
@@ -205,6 +240,13 @@ class StrategyLayer:
         # window (60s) plus slack for clock jitter; bump it if
         # chainlink_window_seconds is ever configured larger than that.
         self._recent_ticks = RecentTickBuffer(DEFAULT_TICK_BUFFER_SECONDS)
+        # Separate, independently-sized buffer for reversion_mu() -- shares
+        # nothing with self._recent_ticks above since reversion_window_seconds
+        # (default 100 minutes) is far longer than DEFAULT_TICK_BUFFER_SECONDS
+        # covers; see DEFAULT_REVERSION_BUFFER_SLACK_SECONDS. Cheap to keep
+        # even at reversion_shrinkage=0.0 (the off-by-default case) -- one
+        # more deque of (timestamp, price) tuples fed alongside the others.
+        self._reversion_ticks = RecentTickBuffer(reversion_window_seconds + DEFAULT_REVERSION_BUFFER_SLACK_SECONDS)
         # current_price/target_price sourced from Chainlink
         # (_on_chainlink_price) -- Binance klines drive the GBM estimator and
         # (via self._recent_ticks) the settlement-window split, see module
@@ -346,6 +388,7 @@ class StrategyLayer:
     async def _on_binance_kline(self, event: BinanceKlineEvent) -> None:
         self._gbm.add_price(event.close)
         self._recent_ticks.add(self._clock(), event.close)
+        self._reversion_ticks.add(self._clock(), event.close)
         if event.is_closed:
             await self._evaluate()
 
@@ -376,7 +419,24 @@ class StrategyLayer:
         if minutes_remaining <= 0:
             return
 
-        mu, sigma = self._gbm.mu, self._gbm.sigma
+        now = self._clock()
+        sigma = self._gbm.sigma
+        # Additive, not a replacement -- short-horizon continuation
+        # (momentum_mu) and long-horizon reversion (reversion_mu) are
+        # separate hypotheses at opposite ends of the lookback spectrum, see
+        # reversion_mu()'s own docstring. reversion_shrinkage defaults to
+        # 0.0, making this term an exact no-op unless deliberately enabled.
+        mu = momentum_mu(
+            self._recent_ticks, now, sigma,
+            window_seconds=self._momentum_window_seconds,
+            z_cap=self._momentum_z_cap,
+            shrinkage=self._momentum_shrinkage,
+        ) + reversion_mu(
+            self._reversion_ticks, now, sigma,
+            window_seconds=self._reversion_window_seconds,
+            z_cap=self._reversion_z_cap,
+            shrinkage=self._reversion_shrinkage,
+        )
         twap_window_seconds = self._chainlink_window_seconds or 0.0
         twap_window_minutes = twap_window_seconds / 60.0
         # Known/unknown settlement-window split (see probability_model.py's
@@ -384,7 +444,6 @@ class StrategyLayer:
         # trailing twap_window_seconds settlement average is already
         # observed at `now`; 0 (i.e. no split, plain probability_up
         # fallback) whenever minutes_remaining still exceeds a full window.
-        now = self._clock()
         known_seconds = max(twap_window_seconds - minutes_remaining * 60.0, 0.0)
         known_average = self._recent_ticks.average_since(now - known_seconds) if known_seconds > 0 else None
         # The raw tick price, not self._current_price (a Chainlink TWAP
@@ -418,35 +477,38 @@ class StrategyLayer:
     ) -> None:
         quote = window.quotes[outcome]
 
-        if not window.wants_position[outcome] and not self._paused and probability > self._entry_line:
-            if quote.ask is None:
-                return  # can't size an entry without an ask yet, retry next tick
-            if probability <= quote.ask:
-                return
-            if quote.ask < 0.4:
-                return
-
-            window.wants_position[outcome] = True
-            window.frozen_target_pct[outcome] = self._kelly_multiplier * kelly_fraction(probability, quote.ask)
-            window.frozen_price[outcome] = quote.ask
-        elif window.wants_position[outcome] and probability <= self._exit_line:
-            window.wants_position[outcome] = False
-            window.frozen_target_pct[outcome] = 0.0
-        elif window.wants_position[outcome] and quote.ask is not None and quote.ask >= 0.4 and probability > quote.ask:
-            # Still wanted, not exiting, and the live ask still leaves edge
-            # on the table -- track it. Strategy has no visibility into
-            # whether the entry attempt at the *old* frozen_price actually
-            # filled (Execution alone owns fill truth, see module
-            # docstring), so if it didn't, resubmitting that same stale
-            # price once the market has moved on has no chance of matching
-            # (observed live: a fast-moving window left the frozen price
-            # far behind the current ask, and every FAK retry for the rest
-            # of the window failed with "no orders found to match").
-            # frozen_target_pct -- the Kelly-derived conviction -- stays
-            # fixed at what was decided on entry, so tick-to-tick
-            # probability noise still can't turn into continuous resizing;
-            # only the mechanical execution price tracks the market.
-            window.frozen_price[outcome] = quote.ask
+        if not window.wants_position[outcome] and not self._paused:
+            if (
+                quote.ask is not None
+                and quote.ask >= 0.4
+                and probability > quote.ask + self._probability_margin
+            ):
+                window.wants_position[outcome] = True
+                window.frozen_target_pct[outcome] = self._kelly_multiplier * kelly_fraction(probability, quote.ask)
+                window.frozen_price[outcome] = quote.ask
+        elif window.wants_position[outcome]:
+            # A reported best_bid of exactly 0 means the bid side is empty
+            # (see the same fallback below for the no-position price) --
+            # fall back to the ask as the sell-side reference in that case.
+            sell_price = quote.bid if quote.bid is not None and quote.bid > 0 else quote.ask
+            if sell_price is not None and probability <= sell_price - self._probability_margin:
+                window.wants_position[outcome] = False
+                window.frozen_target_pct[outcome] = 0.0
+            elif quote.ask is not None and quote.ask >= 0.4 and probability > quote.ask:
+                # Still wanted, not exiting, and the live ask still leaves edge
+                # on the table -- track it. Strategy has no visibility into
+                # whether the entry attempt at the *old* frozen_price actually
+                # filled (Execution alone owns fill truth, see module
+                # docstring), so if it didn't, resubmitting that same stale
+                # price once the market has moved on has no chance of matching
+                # (observed live: a fast-moving window left the frozen price
+                # far behind the current ask, and every FAK retry for the rest
+                # of the window failed with "no orders found to match").
+                # frozen_target_pct -- the Kelly-derived conviction -- stays
+                # fixed at what was decided on entry, so tick-to-tick
+                # probability noise still can't turn into continuous resizing;
+                # only the mechanical execution price tracks the market.
+                window.frozen_price[outcome] = quote.ask
 
         if window.wants_position[outcome]:
             price = window.frozen_price[outcome]

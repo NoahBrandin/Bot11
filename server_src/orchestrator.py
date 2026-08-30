@@ -72,7 +72,17 @@ from utils.json_logging import JsonLinesFormatter
 from monitoring import Monitor, MonitorCategory
 from strategy import StrategyLayer
 from strategy.utils.kelly import DEFAULT_KELLY_MULTIPLIER
-from strategy.manager import DEFAULT_EWMA_HALFLIFE_SECONDS, DEFAULT_HISTORY_SIZE, DEFAULT_PROBABILITY_MARGIN
+from strategy.manager import (
+    DEFAULT_EWMA_HALFLIFE_SECONDS,
+    DEFAULT_HISTORY_SIZE,
+    DEFAULT_MOMENTUM_SHRINKAGE,
+    DEFAULT_MOMENTUM_WINDOW_SECONDS,
+    DEFAULT_MOMENTUM_Z_CAP,
+    DEFAULT_PROBABILITY_MARGIN,
+    DEFAULT_REVERSION_SHRINKAGE,
+    DEFAULT_REVERSION_WINDOW_SECONDS,
+    DEFAULT_REVERSION_Z_CAP,
+)
 from utils import env_config
 
 logger = logging.getLogger("orchestrator")
@@ -122,6 +132,12 @@ class Config:
     strategy_kelly_multiplier: float
     strategy_ewma_halflife_seconds: Optional[float]
     strategy_state_file_path: str
+    strategy_momentum_window_seconds: float
+    strategy_momentum_z_cap: float
+    strategy_momentum_shrinkage: float
+    strategy_reversion_window_seconds: float
+    strategy_reversion_z_cap: float
+    strategy_reversion_shrinkage: float
     execution_retry_cooldown_seconds: float
     execution_rejection_alert_threshold: int
     execution_max_position_notional: Optional[float]
@@ -178,6 +194,24 @@ def load_config() -> Config:
         strategy_state_file_path=env_config.env_str(
             "STRATEGY_STATE_FILE_PATH",
             os.path.join(os.environ.get("LOGS_DIRECTORY", "."), "strategy_state.json"),
+        ),
+        strategy_momentum_window_seconds=env_config.env_float(
+            "STRATEGY_MOMENTUM_WINDOW_SECONDS", DEFAULT_MOMENTUM_WINDOW_SECONDS
+        ),
+        strategy_momentum_z_cap=env_config.env_float(
+            "STRATEGY_MOMENTUM_Z_CAP", DEFAULT_MOMENTUM_Z_CAP
+        ),
+        strategy_momentum_shrinkage=env_config.env_float(
+            "STRATEGY_MOMENTUM_SHRINKAGE", DEFAULT_MOMENTUM_SHRINKAGE
+        ),
+        strategy_reversion_window_seconds=env_config.env_float(
+            "STRATEGY_REVERSION_WINDOW_SECONDS", DEFAULT_REVERSION_WINDOW_SECONDS
+        ),
+        strategy_reversion_z_cap=env_config.env_float(
+            "STRATEGY_REVERSION_Z_CAP", DEFAULT_REVERSION_Z_CAP
+        ),
+        strategy_reversion_shrinkage=env_config.env_float(
+            "STRATEGY_REVERSION_SHRINKAGE", DEFAULT_REVERSION_SHRINKAGE
         ),
         execution_retry_cooldown_seconds=env_config.env_float(
             "EXECUTION_RETRY_COOLDOWN_SECONDS", DEFAULT_RETRY_COOLDOWN_SECONDS
@@ -241,6 +275,12 @@ def _build_strategy_layer(config: Config, execution: ExecutionLayer, monitor: Mo
         kelly_multiplier=config.strategy_kelly_multiplier,
         ewma_halflife_seconds=config.strategy_ewma_halflife_seconds,
         state_file_path=config.strategy_state_file_path,
+        momentum_window_seconds=config.strategy_momentum_window_seconds,
+        momentum_z_cap=config.strategy_momentum_z_cap,
+        momentum_shrinkage=config.strategy_momentum_shrinkage,
+        reversion_window_seconds=config.strategy_reversion_window_seconds,
+        reversion_z_cap=config.strategy_reversion_z_cap,
+        reversion_shrinkage=config.strategy_reversion_shrinkage,
     )
 
 

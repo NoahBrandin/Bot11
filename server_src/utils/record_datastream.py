@@ -66,7 +66,7 @@ DEFAULT_BINANCE_INTERVAL = "1m"
 # finished segments to Google Drive and deletes them locally, so this cap is
 # a safety net rather than the only thing bounding disk usage.
 LOG_FILE_MAX_BYTES = 50 * 1024 * 1024
-LOG_FILE_BACKUP_COUNT = 10
+LOG_FILE_BACKUP_COUNT = 100
 
 logger = logging.getLogger("record_datastream")
 

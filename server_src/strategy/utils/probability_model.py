@@ -24,12 +24,64 @@ anymore.
 Also home to probability_up(), the actual P(S_T >= reference_price) GBM
 formula -- unrelated to the estimator above other than consuming its mu/
 sigma; kept in this module so StrategyLayer only needs one import.
+
+mu itself (see momentum_mu() below) no longer comes from GBMEstimator.
+GBMEstimator.mu used to be hardcoded to 0 (martingale assumption): for a
+naive sample-mean drift estimator, Var(mu_hat) = sigma^2/T depends only on
+the calibration window's calendar length T, not tick count, so no amount of
+high-frequency data fixes its noise -- confirmed against a live paper-run
+log where median |mu|/sigma was 1.14 (noise dominating any real signal).
+momentum_mu() sidesteps that specific failure mode by not estimating a
+sample mean over the long calibration window at all -- it reads a much
+shorter-horizon momentum z-score off RecentTickBuffer instead (still noisy,
+but a structurally different, deliberately capped and shrunk estimate).
 """
 from __future__ import annotations
 
 import math
 from collections import deque
 from typing import Deque, List, Optional, Sequence, Tuple
+
+# momentum_mu()/reversion_mu() defaults. window_seconds=15 (down from an
+# original 30) was calibrated from two independent sources:
+# other_src/research/'s event-study on 30 days of raw BTC ticks found
+# forward-return edge decaying with lookback window length (a 5s RoC
+# signal's hit-rate edge was ~2x a 60s RoC signal's at every horizon
+# tested), and a matching other_src/run_backtest.py + calibration_report.py
+# sweep over window_seconds in {5,10,15,30,60} (5-day tick backtest)
+# confirmed window=15 beats the old window=30 on both Brier (0.1522 vs
+# 0.1559) and log-loss (0.6276 vs 0.6344). z_cap untouched by either
+# recalibration below.
+#
+# shrinkage values were updated 2026-08-30 from a 2D grid search
+# (momentum_shrinkage x reversion_shrinkage, 30 cells) against ONE 35h live
+# recording (see md/backtest_recording_mu_calibration_2026-08-30.md) --
+# momentum=0.05/reversion=0.30 beat the prior momentum=0.15/reversion=0.0
+# (positions PnL -$22.99 -> +$40.98, win rate 62.1% -> 65.3%, profit factor
+# 0.93 -> 1.147 on that recording). This is NOT the same rigor as the
+# window_seconds calibration above (no multi-day event-study, single
+# recording, 30-cell search -- real overfitting risk) and MUST be
+# reswept the same way (event-study + multi-day backtest sweep) before
+# being trusted as more than a starting point for that work.
+DEFAULT_MOMENTUM_WINDOW_SECONDS = 15.0
+DEFAULT_MOMENTUM_Z_CAP = 3.0
+DEFAULT_MOMENTUM_SHRINKAGE = 0.05
+
+# reversion_mu() -- see its docstring for what this measures (long-horizon
+# mean reversion, additive to momentum_mu()'s short-horizon continuation).
+# Prompted by a backtest finding: the pre-momentum era's discarded flat
+# 100-minute sample-mean mu (see module docstring above) performed *better*
+# with its sign flipped than in its original form, consistently across both
+# the old and the current sigma estimator -- not "the old estimator was
+# almost right" (its magnitude is still exactly the noisy, un-shrinkable
+# sample-mean statistic this module abandoned), but the *sign* flip pointed
+# at a real, different hypothesis at the long end of the horizon spectrum.
+# shrinkage=0.30 is the 2026-08-30 grid-search value -- see
+# DEFAULT_MOMENTUM_SHRINKAGE's comment above for the same single-recording
+# caveat; pass 0.0 to fully disable this term (its pre-calibration default).
+DEFAULT_REVERSION_WINDOW_SECONDS = 6000.0  # 100 minutes -- matches the old GBMEstimator's history_size-derived window, see manager.py
+DEFAULT_REVERSION_Z_CAP = 3.0
+DEFAULT_REVERSION_SHRINKAGE = 0.30
 
 
 class RealizedVarianceEstimator:
@@ -190,25 +242,6 @@ class GBMEstimator:
         variance_per_minute = self._tsrv.noise_corrected_rv / total_minutes
         return math.sqrt(max(variance_per_minute, 0.0))
 
-    @property
-    def mu(self) -> float:
-        """Fixed at 0 (martingale assumption) -- not estimated from price
-        history at all, deliberately.
-
-        Var(mu_hat) = sigma^2 / T depends only on the calibration window's
-        calendar length T, not on tick count -- unlike sigma, more/faster
-        ticks buy nothing here, so there's no version of this estimator that
-        high-frequency data would fix. Checked against today's live paper-run
-        log (server_src/log.jsonl, 194 readings of probability_model.py's actual live mu/
-        sigma): median |mu|/sigma was 1.14, with |mu| > sigma in 53.6% of
-        readings -- a real drift that large relative to sigma at this
-        calibration window would be extraordinary; estimation noise dominating
-        the signal is the mundane explanation. Fed into probability_up's
-        drift_term vs vol_term, that noise ends up dominating the vol term by
-        roughly sigma's own ratio times sqrt(minutes_remaining) -- ~2.5x at a
-        5-minute horizon and the observed median ratio."""
-        return 0.0
-
 
 class RecentTickBuffer:
     """Rolling (timestamp, price) buffer of raw ticks, retained for
@@ -234,9 +267,121 @@ class RecentTickBuffer:
         values = [p for t, p in self._ticks if t >= since_timestamp]
         return (sum(values) / len(values)) if values else None
 
+    def average_between(self, start_timestamp: float, end_timestamp: float) -> Optional[float]:
+        """Mean price of retained ticks with start_timestamp <= t < end_timestamp
+        -- the disjoint-window building block momentum_mu() below needs (unlike
+        average_since's open-ended [since_timestamp, latest] window). None if
+        the buffer doesn't (yet) cover this range at all."""
+        values = [p for t, p in self._ticks if start_timestamp <= t < end_timestamp]
+        return (sum(values) / len(values)) if values else None
+
     @property
     def latest_price(self) -> Optional[float]:
         return self._ticks[-1][1] if self._ticks else None
+
+
+def momentum_mu(
+    ticks: RecentTickBuffer,
+    now: float,
+    sigma: float,
+    window_seconds: float = DEFAULT_MOMENTUM_WINDOW_SECONDS,
+    z_cap: float = DEFAULT_MOMENTUM_Z_CAP,
+    shrinkage: float = DEFAULT_MOMENTUM_SHRINKAGE,
+) -> float:
+    """Short-horizon momentum drift estimate, replacing the old fixed mu=0
+    (see module docstring for why the old sample-mean approach was
+    abandoned rather than just re-enabled here).
+
+    Compares two disjoint, equal-length TWAP legs -- [now-2W, now-W) vs
+    [now-W, now) -- rather than the more obvious-looking overlapping
+    TWAP(W) vs TWAP(2W) spread: the most recent W seconds are included in
+    *both* an overlapping W-window and a 2W-window average, so most of that
+    spread would be mechanical overlap arithmetic, not a clean read on
+    whether price actually moved between the prior and most recent
+    interval. Disjoint legs isolate the real momentum.
+
+    ret_recent is a log return (not the raw price difference), matching
+    every other return in this module (RealizedVarianceEstimator, GBM's own
+    log-price SDE) and matching how mu is actually consumed -- as a
+    log-price drift rate in probability_up's drift_term, not an arithmetic
+    one.
+
+    ret_recent is then scaled by the W-second window's own vol (sigma is
+    per-minute, so that's sigma * sqrt(W/60)) into a dimensionless,
+    regime-comparable z-score and clipped to +/-z_cap -- important, because
+    z_momentum * sigma would otherwise just cancel sigma back out
+    algebraically (z_momentum's denominator already *is* sigma, scaled by a
+    constant), making the result independent of the current vol regime and
+    turning the whole normalization step into a no-op. The cap is what
+    makes it not a no-op: it bounds how much a single extreme tick can
+    inflate mu when vol is currently low, rather than only rescaling it.
+
+    shrinkage then damps the capped z-score before it's rescaled by sigma
+    back into per-minute drift units -- start conservative (see
+    DEFAULT_MOMENTUM_SHRINKAGE) given how noisy any short-horizon momentum
+    signal is expected to be, same spirit as the old mu=0 default.
+
+    Returns 0.0 (the old default) whenever sigma is degenerate or the tick
+    buffer doesn't yet cover both full window_seconds legs (2*window_seconds
+    of history) -- the same "not ready yet" fallback GBMEstimator.mu used to
+    give unconditionally.
+    """
+    if sigma <= 0:
+        return 0.0
+    recent = ticks.average_between(now - window_seconds, now)
+    prior = ticks.average_between(now - 2 * window_seconds, now - window_seconds)
+    if recent is None or prior is None or prior <= 0:
+        return 0.0
+    ret_recent = math.log(recent / prior)
+    window_vol = sigma * math.sqrt(window_seconds / 60.0)
+    if window_vol <= 0:
+        return 0.0
+    z_momentum = max(-z_cap, min(z_cap, ret_recent / window_vol))
+    return shrinkage * z_momentum * sigma
+
+
+def reversion_mu(
+    ticks: RecentTickBuffer,
+    now: float,
+    sigma: float,
+    window_seconds: float = DEFAULT_REVERSION_WINDOW_SECONDS,
+    z_cap: float = DEFAULT_REVERSION_Z_CAP,
+    shrinkage: float = DEFAULT_REVERSION_SHRINKAGE,
+) -> float:
+    """Long-horizon mean-reversion drift estimate, additive to momentum_mu()
+    rather than a replacement for it -- see DEFAULT_REVERSION_SHRINKAGE's
+    comment for where this idea came from.
+
+    Unlike momentum_mu()'s two disjoint legs (isolating whether price moved
+    between two adjacent intervals), this compares the single latest tick
+    against the trailing window_seconds average -- the natural "how far has
+    price strayed from its own recent anchor" reversion measure, not a
+    momentum-style delta between two intervals.
+
+    latest requires its own ticks buffer sized for window_seconds (unlike
+    momentum_mu(), which shares StrategyLayer's short DEFAULT_TICK_BUFFER_
+    SECONDS buffer) -- see manager.py's self._reversion_ticks.
+
+    Sign is the mirror image of momentum_mu(): deviation > 0 (price above
+    its trailing average) pulls mu *negative* (expected reversion back
+    down), not positive like a continuation signal would.
+
+    Same z-score/cap/shrinkage discipline as momentum_mu() for the same
+    reason -- see its docstring -- and the same 0.0 fallback whenever sigma
+    is degenerate or the buffer doesn't yet cover the full window.
+    """
+    if sigma <= 0:
+        return 0.0
+    trailing_average = ticks.average_since(now - window_seconds)
+    latest = ticks.latest_price
+    if trailing_average is None or latest is None or trailing_average <= 0:
+        return 0.0
+    deviation = math.log(latest / trailing_average)
+    window_vol = sigma * math.sqrt(window_seconds / 60.0)
+    if window_vol <= 0:
+        return 0.0
+    z_deviation = max(-z_cap, min(z_cap, deviation / window_vol))
+    return -shrinkage * z_deviation * sigma
 
 
 def probability_up(

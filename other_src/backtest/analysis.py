@@ -13,12 +13,14 @@ from collections import defaultdict
 from statistics import fmean, median
 from typing import Optional
 
+from .recording import Window
+
 CALIBRATION_BUCKET_SIZE = 0.05
 
 
 def build_report(
     trade_records: list[dict],
-    windows: list[dict],
+    windows: list[Window],
     time_bucket_seconds: float,
     meta: dict,
 ) -> dict:
@@ -32,21 +34,17 @@ def build_report(
         "order_time_distribution": _order_time_distribution(filled, time_buckets),
         "order_price_distribution": _order_price_distribution(filled),
         "rejection_summary": _rejection_summary(trade_records, not_filled, time_buckets),
-        "take_profit_analysis": _test_for_take_profit(windows, positions)
-        #"positions_summary": _positions_summary(positions),
-        #"calibration": _calibration(positions),
-        #"entry_time_pnl": _entry_time_pnl(positions, time_buckets),
-        #"window_participation": _window_participation(trade_records, windows),
-        #"positions": positions,
+        "positions_summary": _positions_summary(positions),
+        "calibration": _calibration(positions),
+        "entry_time_pnl": _entry_time_pnl(positions, time_buckets),
+        "window_participation": _window_participation(trade_records, windows),
     }
 
-def _test_for_take_profit(windows: list[dict], positions: list[dict]):
-        print(positions)
 
-def _time_bucket_range(windows: list[dict], size: float) -> list[float]:
+def _time_bucket_range(windows: list[Window], size: float) -> list[float]:
     if not windows:
         return [0.0]
-    duration = max(w["window_end"] - w["window_start"] for w in windows)
+    duration = max(w.window_end - w.window_start for w in windows)
     if size <= 0:
         return [0.0]
     n = int(duration // size) + 1
@@ -133,19 +131,24 @@ def _build_positions(filled: list[dict]) -> list[dict]:
         key = (r["window_slug"], r["outcome"])
         if r["action"] == "BUY":
             if key in open_by_key:
-                positions.append(_close_position(open_by_key.pop(key), None))
+                _append(positions, _close_position(open_by_key.pop(key), None))
             open_by_key[key] = r
         else:
             entry = open_by_key.pop(key, None)
             if entry is None:
                 continue
-            positions.append(_close_position(entry, r))
+            _append(positions, _close_position(entry, r))
     for entry in open_by_key.values():
-        positions.append(_close_position(entry, None))
+        _append(positions, _close_position(entry, None))
     return positions
 
 
-def _close_position(entry: dict, exit_: Optional[dict]) -> dict:
+def _append(positions: list[dict], position: Optional[dict]) -> None:
+    if position is not None:
+        positions.append(position)
+
+
+def _close_position(entry: dict, exit_: Optional[dict]) -> Optional[dict]:
     entry_price = entry["filled_price"]
     entry_size = entry["filled_size"]
     entry_fee = entry["fee"]
@@ -153,9 +156,19 @@ def _close_position(entry: dict, exit_: Optional[dict]) -> dict:
     resolved_outcome = entry["resolved_outcome"]
     held_to_expiry = exit_ is None
     # entry["outcome"] is Outcome.value ("Up"/"Down"); resolved_outcome comes
-    # from the downloaded window data ("UP"/"DOWN", see download.py) --
+    # from recording.py's Chainlink-boundary resolution ("UP"/"DOWN") --
     # different casing for the same two values, normalize before comparing.
-    entered_outcome_won = entry["outcome"].upper() == resolved_outcome
+    # None (not False) when the window's outcome couldn't be resolved (see
+    # recording.py/engine.py) -- a position entered_outcome_won=False would
+    # be indistinguishable from a real loss, silently fabricating one.
+    entered_outcome_won = None if resolved_outcome is None else entry["outcome"].upper() == resolved_outcome
+
+    if held_to_expiry and entered_outcome_won is None:
+        # No real payout was ever credited for this position (engine.py
+        # only calls execution.settle() for resolved windows) and there's
+        # no exit fill to fall back on either -- pnl is fundamentally
+        # unknowable, not zero or a loss. Drop it rather than guess.
+        return None
 
     if exit_ is not None:
         exit_price = exit_["filled_price"]
@@ -238,14 +251,20 @@ def _calibration(positions: list[dict], bucket_size: float = CALIBRATION_BUCKET_
         groups[b].append(p)
     rows = []
     for b, group in sorted(groups.items()):
-        outcome_hits = sum(1 for p in group if p["entered_outcome_won"])
+        # A closed-before-expiry position can still have entered_outcome_won
+        # None (its window never resolved -- see _close_position) even
+        # though its pnl is a real, exit-fill-based number; only the
+        # outcome-rate side of the row excludes those, not win_rate/pnl.
+        known_outcome = [p for p in group if p["entered_outcome_won"] is not None]
+        outcome_hits = sum(1 for p in known_outcome if p["entered_outcome_won"])
         win_hits = sum(1 for p in group if p["pnl"] > 0)
         rows.append(
             {
                 "probability_bucket": round(b, 4),
                 "count": len(group),
                 "mean_modeled_probability": fmean(p["entry_probability"] for p in group),
-                "actual_outcome_rate_pct": outcome_hits / len(group) * 100.0,
+                "actual_outcome_rate_pct": (outcome_hits / len(known_outcome) * 100.0) if known_outcome else None,
+                "outcome_known_count": len(known_outcome),
                 "win_rate_pct": win_hits / len(group) * 100.0,
                 "mean_pnl": fmean(p["pnl"] for p in group),
             }
@@ -275,7 +294,7 @@ def _entry_time_pnl(positions: list[dict], time_buckets: list[float]) -> list[di
     return rows
 
 
-def _window_participation(all_records: list[dict], windows: list[dict]) -> dict:
+def _window_participation(all_records: list[dict], windows: list[Window]) -> dict:
     traded_slugs = {r["window_slug"] for r in all_records}
     total = len(windows)
     return {

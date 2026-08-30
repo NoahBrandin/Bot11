@@ -16,3 +16,8 @@ polymarket-client>=0.3.0
 
 # Equity-curve/drawdown/PnL-distribution chart in performance_review.py.
 matplotlib>=3.8
+
+# Vectorized time-series ops (research/) and statistical tests (KS test,
+# t-test) in research/event_study.py.
+numpy>=2.0
+scipy>=1.13

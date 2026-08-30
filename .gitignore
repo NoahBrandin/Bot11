@@ -32,6 +32,7 @@ Thumbs.db
 other_src/data/
 other_src/backtest_data_*.json
 other_src/backtest_run_data_*.jsonl
+/data/
 
 # Runtime state
 strategy_state.json
