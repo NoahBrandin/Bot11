@@ -19,6 +19,15 @@ an open subscription. The SDK's SubscriptionHandle restores itself across
 disconnects internally, so the outer reconnect loop here (modeled after
 binance_feed.py's) is only a backstop for the whole client connection dying
 outright.
+
+That internal auto-restore is also why it's not a complete backstop:
+recorder logs have shown multi-minute stretches with zero ChainlinkPriceEvents
+and no logged reconnect at all -- the SDK evidently retries the underlying
+connection silently in some failure modes without the `async for` ever
+raising, so `run()`'s `except Exception` never fires. `_run_once` below adds
+its own staleness watchdog (independent of the SDK) so a quiet stream still
+gets torn down and resubscribed, and -- unlike the SDK's silent retries --
+logged.
 """
 from __future__ import annotations
 
@@ -40,6 +49,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_SYMBOL = "btc/usd"
 DEFAULT_WINDOW_SECONDS = 60
 DEFAULT_RECONNECT_DELAY = 2.0
+# Observed live tick cadence is roughly one every 1-2s -- 10s of silence is
+# already well outside normal jitter, and far short of the multi-minute
+# silent stalls this is meant to catch (see module docstring).
+DEFAULT_STALE_TIMEOUT = 10.0
 
 
 class ChainlinkFeed:
@@ -50,12 +63,14 @@ class ChainlinkFeed:
         window_seconds: int = DEFAULT_WINDOW_SECONDS,
         monitor: Optional[Monitor] = None,
         reconnect_delay: float = DEFAULT_RECONNECT_DELAY,
+        stale_timeout: float = DEFAULT_STALE_TIMEOUT,
     ) -> None:
         self._queue = queue
         self._symbol = symbol
         self._window_seconds = window_seconds
         self._monitor = monitor or Monitor()
         self._reconnect_delay = reconnect_delay
+        self._stale_timeout = stale_timeout
 
     async def run(self) -> None:
         while True:
@@ -70,7 +85,26 @@ class ChainlinkFeed:
         async with AsyncPublicClient() as client:
             spec = CryptoPricesChainlinkTwapSpec(window_seconds=self._window_seconds, symbols=[self._symbol])
             async with await client.subscribe(spec) as stream:
-                async for event in stream:
+                stream_iter = stream.__aiter__()
+                while True:
+                    try:
+                        event = await asyncio.wait_for(stream_iter.__anext__(), timeout=self._stale_timeout)
+                    except asyncio.TimeoutError:
+                        # Not an exception the SDK raised -- our own watchdog,
+                        # since its internal auto-restore can otherwise leave
+                        # the subscription silently dead (see module
+                        # docstring). Returning drops this stream/client and
+                        # lets run() resubscribe from scratch after
+                        # reconnect_delay, same as a real connection error.
+                        logger.warning(
+                            "Chainlink feed stale (no tick in %.0fs), reconnecting", self._stale_timeout
+                        )
+                        self._monitor.error(
+                            f"Chainlink feed stale (no tick in {self._stale_timeout:.0f}s), reconnecting"
+                        )
+                        return
+                    except StopAsyncIteration:
+                        return
                     self._handle_event(event)
 
     def _handle_event(self, event: CryptoPricesChainlinkTwapEvent) -> None:

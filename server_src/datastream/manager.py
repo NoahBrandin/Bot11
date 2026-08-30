@@ -21,6 +21,7 @@ from monitoring import Monitor
 from datastream.feeds.binance_feed import BinanceFeed
 from datastream.feeds.binance_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_BINANCE_RECONNECT_DELAY
 from datastream.feeds.chainlink_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_CHAINLINK_RECONNECT_DELAY
+from datastream.feeds.chainlink_feed import DEFAULT_STALE_TIMEOUT as DEFAULT_CHAINLINK_STALE_TIMEOUT
 from datastream.feeds.chainlink_feed import DEFAULT_SYMBOL as DEFAULT_CHAINLINK_SYMBOL
 from datastream.feeds.chainlink_feed import DEFAULT_WINDOW_SECONDS as DEFAULT_CHAINLINK_WINDOW_SECONDS
 from datastream.feeds.chainlink_feed import ChainlinkFeed
@@ -49,6 +50,7 @@ class DatastreamLayer:
         chainlink_symbol: str = DEFAULT_CHAINLINK_SYMBOL,
         chainlink_window_seconds: int = DEFAULT_CHAINLINK_WINDOW_SECONDS,
         chainlink_reconnect_delay: float = DEFAULT_CHAINLINK_RECONNECT_DELAY,
+        chainlink_stale_timeout: float = DEFAULT_CHAINLINK_STALE_TIMEOUT,
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
         prefetch_lead_seconds: float = DEFAULT_PREFETCH_LEAD_SECONDS,
         window_fetch_retry_delay: float = DEFAULT_FETCH_RETRY_DELAY,
@@ -75,6 +77,7 @@ class DatastreamLayer:
             window_seconds=chainlink_window_seconds,
             monitor=self._monitor,
             reconnect_delay=chainlink_reconnect_delay,
+            stale_timeout=chainlink_stale_timeout,
         )
         self._window_seconds = window_seconds
         self._prefetch_lead_seconds = prefetch_lead_seconds

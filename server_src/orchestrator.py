@@ -43,6 +43,7 @@ from dotenv import load_dotenv
 from datastream import DatastreamLayer
 from datastream.feeds.binance_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_BINANCE_RECONNECT_DELAY
 from datastream.feeds.chainlink_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_CHAINLINK_RECONNECT_DELAY
+from datastream.feeds.chainlink_feed import DEFAULT_STALE_TIMEOUT as DEFAULT_CHAINLINK_STALE_TIMEOUT
 from datastream.feeds.chainlink_feed import DEFAULT_SYMBOL as DEFAULT_CHAINLINK_SYMBOL
 from datastream.feeds.chainlink_feed import DEFAULT_WINDOW_SECONDS as DEFAULT_CHAINLINK_WINDOW_SECONDS
 from datastream.utils.gamma_client import DEFAULT_WINDOW_SECONDS
@@ -124,6 +125,7 @@ class Config:
     chainlink_symbol: str
     chainlink_window_seconds: int
     chainlink_reconnect_delay: float
+    chainlink_stale_timeout: float
     window_seconds: float
     prefetch_lead_seconds: float
     window_fetch_retry_delay: float
@@ -175,6 +177,9 @@ def load_config() -> Config:
         ),
         chainlink_reconnect_delay=env_config.env_float(
             "DATASTREAM_CHAINLINK_RECONNECT_DELAY_SECONDS", DEFAULT_CHAINLINK_RECONNECT_DELAY
+        ),
+        chainlink_stale_timeout=env_config.env_float(
+            "DATASTREAM_CHAINLINK_STALE_TIMEOUT_SECONDS", DEFAULT_CHAINLINK_STALE_TIMEOUT
         ),
         window_seconds=env_config.env_float("DATASTREAM_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS),
         prefetch_lead_seconds=env_config.env_float(
@@ -257,6 +262,7 @@ def _build_datastream_layer(config: Config, monitor: Monitor) -> DatastreamLayer
         chainlink_symbol=config.chainlink_symbol,
         chainlink_window_seconds=config.chainlink_window_seconds,
         chainlink_reconnect_delay=config.chainlink_reconnect_delay,
+        chainlink_stale_timeout=config.chainlink_stale_timeout,
         window_seconds=config.window_seconds,
         prefetch_lead_seconds=config.prefetch_lead_seconds,
         window_fetch_retry_delay=config.window_fetch_retry_delay,

@@ -45,6 +45,7 @@ from datastream import (
 )
 from datastream.feeds.binance_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_BINANCE_RECONNECT_DELAY
 from datastream.feeds.chainlink_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_CHAINLINK_RECONNECT_DELAY
+from datastream.feeds.chainlink_feed import DEFAULT_STALE_TIMEOUT as DEFAULT_CHAINLINK_STALE_TIMEOUT
 from datastream.feeds.chainlink_feed import DEFAULT_SYMBOL as DEFAULT_CHAINLINK_SYMBOL
 from datastream.feeds.chainlink_feed import DEFAULT_WINDOW_SECONDS as DEFAULT_CHAINLINK_WINDOW_SECONDS
 from datastream.feeds.polymarket_feed import DEFAULT_APP_PING_INTERVAL, DEFAULT_POLYMARKET_POLL_INTERVAL
@@ -135,6 +136,9 @@ def _build_datastream_layer() -> DatastreamLayer:
         ),
         chainlink_reconnect_delay=env_config.env_float(
             "DATASTREAM_CHAINLINK_RECONNECT_DELAY_SECONDS", DEFAULT_CHAINLINK_RECONNECT_DELAY
+        ),
+        chainlink_stale_timeout=env_config.env_float(
+            "DATASTREAM_CHAINLINK_STALE_TIMEOUT_SECONDS", DEFAULT_CHAINLINK_STALE_TIMEOUT
         ),
         window_seconds=env_config.env_float("DATASTREAM_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS),
         prefetch_lead_seconds=env_config.env_float(

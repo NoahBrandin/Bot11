@@ -17,6 +17,7 @@ takes for its (simpler, replay-free) market-price Brier score.
 """
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import json
 import logging
@@ -64,6 +65,15 @@ _PRIORITY = {
 }
 
 _ROTATION_SUFFIX = re.compile(r"\.jsonl\.(\d+)$")
+
+# The live Chainlink feed ticks roughly once a second but occasionally skips
+# the exact whole-second a window boundary lands on by a beat (e.g. ticks at
+# .../299 and .../301, none at .../300) despite otherwise ticking normally --
+# a timing/jitter miss, not a feed outage. Falling back to the nearest tick
+# within this many seconds recovers those windows; real multi-second-plus
+# outages (see chainlink_feed.py's staleness watchdog) still fall outside it
+# and stay unresolved rather than being resolved from a stale-ish price.
+DEFAULT_BOUNDARY_TOLERANCE_SECONDS = 2.0
 
 
 def _rotation_sort_key(path: Path) -> int:
@@ -116,10 +126,14 @@ class Recording:
     windows: dict[str, Window]
 
 
-def load_recording(log_dir: Path) -> Recording:
+def load_recording(log_dir: Path, boundary_tolerance_seconds: float = DEFAULT_BOUNDARY_TOLERANCE_SECONDS) -> Recording:
     events: list[Event] = []
     windows: dict[str, Window] = {}
     chainlink_by_second: dict[int, float] = {}
+    # Chronological (timestamp, price) ticks, for the tolerance fallback --
+    # kept separate from chainlink_by_second since that dict only needs the
+    # last tick per second, not every one.
+    chainlink_ticks: list[tuple[float, float]] = []
     bad_lines = 0
 
     log_files = discover_log_files(log_dir)
@@ -157,25 +171,50 @@ def load_recording(log_dir: Path) -> Recording:
                     # earlier ones -- last-observed value for that second,
                     # same as what a live consumer ends up holding.
                     chainlink_by_second[round(event.source_timestamp)] = event.price
+                    chainlink_ticks.append((event.source_timestamp, event.price))
 
     if bad_lines:
         logger.warning("%d unparseable log line(s) skipped", bad_lines)
 
     events.sort(key=lambda e: (e.timestamp, _PRIORITY.get(type(e), 0)))
+    chainlink_ticks.sort(key=lambda tick: tick[0])
+    chainlink_times = [ts for ts, _ in chainlink_ticks]
+
+    def _chainlink_price_near(second: float) -> Optional[float]:
+        exact = chainlink_by_second.get(round(second))
+        if exact is not None:
+            return exact
+        if not chainlink_times:
+            return None
+        i = bisect.bisect_left(chainlink_times, second)
+        best_price, best_dist = None, boundary_tolerance_seconds
+        for idx in (i - 1, i):
+            if 0 <= idx < len(chainlink_times):
+                dist = abs(chainlink_times[idx] - second)
+                if dist <= best_dist:
+                    best_dist = dist
+                    best_price = chainlink_ticks[idx][1]
+        return best_price
 
     resolved = 0
+    resolved_via_tolerance = 0
     for w in windows.values():
         if not w.closed:
             continue
-        target = chainlink_by_second.get(round(w.window_start))
-        settlement = chainlink_by_second.get(round(w.window_end))
+        exact_target = chainlink_by_second.get(round(w.window_start))
+        exact_settlement = chainlink_by_second.get(round(w.window_end))
+        target = exact_target if exact_target is not None else _chainlink_price_near(w.window_start)
+        settlement = exact_settlement if exact_settlement is not None else _chainlink_price_near(w.window_end)
         if target is None or settlement is None:
             continue
         w.resolved_outcome = "UP" if settlement >= target else "DOWN"
         resolved += 1
+        if exact_target is None or exact_settlement is None:
+            resolved_via_tolerance += 1
 
     logger.info(
-        "Parsed %d events, %d windows (%d resolved, %d unresolved/open)",
-        len(events), len(windows), resolved, len(windows) - resolved,
+        "Parsed %d events, %d windows (%d resolved [%d via %.0fs tolerance], %d unresolved/open)",
+        len(events), len(windows), resolved, resolved_via_tolerance, boundary_tolerance_seconds,
+        len(windows) - resolved,
     )
     return Recording(events=events, windows=windows)
