@@ -189,14 +189,97 @@ mit starker Reversion schneidet besser ab als der aktuelle Default (0.15)
 — die beiden Signale scheinen sich in dieser Stichprobe teilweise zu
 überschneiden statt sich sauber zu ergänzen.
 
-## 6. Nächste Schritte
+## 6. Werte als Defaults übernommen
 
-1. **Vor jeder Default-Änderung:** `reversion_shrinkage`/`momentum_shrinkage`
-   auf einer Mehrtage-/Wochen-Aufzeichnung mit derselben Methodik wie beim
-   ursprünglichen Momentum-Tuning validieren (Event-Study + Backtest-Sweep,
-   Brier-/Log-Loss-Vergleich) — die hier gefundenen Werte sind auf 30
-   Grid-Zellen über eine einzige 35h-Aufzeichnung optimiert und damit ein
-   reales Overfitting-Risiko.
+Auf explizite Anweisung wurden die Grid-Search-Werte trotz der schwachen
+Evidenzbasis (siehe Warnung oben) als neue Defaults in
+`server_src/strategy/utils/probability_model.py` gesetzt:
+
+- `DEFAULT_MOMENTUM_SHRINKAGE`: 0.15 → **0.05**
+- `DEFAULT_REVERSION_SHRINKAGE`: 0.0 → **0.30**
+
+Verifiziert: `run_backtest.py` ohne explizite `--momentum-shrinkage`/
+`--reversion-shrinkage`-Flags reproduziert exakt das Grid-Search-Ergebnis
+(Paper-PnL -$15,44). Betrifft auch den Live-Bot (`orchestrator.py` nutzt
+dieselben Defaults, sofern `STRATEGY_MOMENTUM_SHRINKAGE`/
+`STRATEGY_REVERSION_SHRINKAGE` nicht per `.env` überschrieben sind).
+Code-Kommentare und `[[project_momentum_mu_shrinkage]]`-Memory wurden
+entsprechend aktualisiert, inkl. des Hinweises auf die schwächere
+Evidenzlage dieser Runde gegenüber der ursprünglichen
+`momentum_window_seconds`-Kalibrierung.
+
+**Noch nicht committed oder deployed.**
+
+## 7. Sweep: `reversion_window_seconds`
+
+Grober Sweep über die Fensterlänge (10–300 Minuten), bei den neuen
+Defaults (`momentum_shrinkage=0.05`, `reversion_shrinkage=0.30`):
+
+| Fenster | Positions-PnL | Win-Rate | Profit Factor |
+|---|---|---|---|
+| 10 min | -$29,08 | 62,8% | 0,916 |
+| 20 min | -$28,74 | 60,8% | 0,917 |
+| 30 min | -$7,60 | 62,1% | 0,977 |
+| 50 min | $38,19 | 65,6% | 1,134 |
+| 75 min | $24,26 | 65,2% | 1,083 |
+| **100 min (aktueller Default)** | **$40,98** | **65,3%** | **1,147** |
+| 125 min | $19,93 | 65,0% | 1,068 |
+| 150 min | -$5,41 | 63,5% | 0,983 |
+| 200 min | -$8,89 | 64,1% | 0,971 |
+| 300 min | $6,99 | 64,4% | 1,022 |
+
+Sauber glockenförmiges Muster mit Optimum bei ~100min (schwach/negativ bei
+sehr kurzen Fenstern, fällt nach ~125-150min wieder ab). `DEFAULT_
+REVERSION_WINDOW_SECONDS = 6000.0` (100min) war bereits optimal im
+getesteten Bereich — keine Änderung nötig.
+
+## 8. TWAP-Vergleich: Chainlink vs. aus Binance-Ticks rekonstruiert
+
+Frage: wie stark weicht der echte Chainlink-TWAP (wonach Polymarket
+tatsächlich abrechnet) von einem selbst rekonstruierten TWAP aus den rohen
+Binance-Ticks ab — relevant, weil `momentum_mu()`/`reversion_mu()` beide auf
+Binance-Ticks laufen (`self._recent_ticks`/`self._reversion_ticks`), nicht
+auf Chainlink.
+
+Methode: für jedes der 99.387 aufgezeichneten `chainlink_price`-Events den
+zeitgewichteten Binance-TWAP über dasselbe `window_seconds`-Fenster
+(Treppenfunktion aus den rohen Kline-Ticks) nachgebaut und verglichen.
+
+| Metrik | Wert |
+|---|---|
+| Mittlere Differenz (Chainlink − Binance) | -$3,48 |
+| Mittlerer Betrag der Differenz | $3,89 |
+| Streuung (Stdev) | $3,22 |
+| In Basispunkten | Ø -0,45 bps, Ø\|Diff\| 0,50 bps |
+| Maximale Abweichung | $16,57 (~2 bps) |
+
+Bei ~$78.000 BTC-Preis ist das absolut winzig — die Binance-Rekonstruktion
+ist als reiner TWAP-Ersatz erstaunlich nah dran.
+
+**Aber ein kleiner, erklärbarer systematischer Bias:** Lag-Scan (Binance-
+Serie um ±3s verschoben, Fehler neu gemessen) zeigt das beste Match bei
+-2s — Chainlink hinkt Binance also um ~1-2s hinterher (plausibel: Oracle-
+Aggregations-/Relay-Latenz). Über die Aufzeichnung ist BTC netto gestiegen
+(+1,52%, $77.654 → $78.835); ein leicht verzögerter Preis liest in einem
+Aufwärtstrend systematisch niedriger — genau das beobachtete Vorzeichen
+des Bias. Beide Befunde erklären sich gegenseitig, wirken nicht wie zwei
+unabhängige Zufälle.
+
+**Einordnung:** klein genug, um nicht die Hauptursache der bisherigen
+Verluste zu sein, aber bei einer Strategie, die ohnehin mit hauchdünnen
+Edges kämpft (siehe Abschnitt 2), potenziell relevant am Rand — kein
+akuter Fix, aber ein Kandidat für spätere Verfeinerung (z.B.
+`reversion_mu()`/`momentum_mu()` testweise auf Chainlink statt Binance-
+Ticks umstellen und vergleichen).
+
+## 9. Nächste Schritte
+
+1. **Vor Live-Einsatz der neuen Defaults:** `reversion_shrinkage`/
+   `momentum_shrinkage` auf einer Mehrtage-/Wochen-Aufzeichnung mit
+   derselben Methodik wie beim ursprünglichen Momentum-Tuning validieren
+   (Event-Study + Backtest-Sweep, Brier-/Log-Loss-Vergleich) — die aktuell
+   gesetzten Werte sind auf 30 Grid-Zellen über eine einzige
+   35h-Aufzeichnung optimiert und damit ein reales Overfitting-Risiko.
 2. Prüfen, warum Momentum und Reversion sich in dieser Stichprobe
    gegenseitig zu dämpfen scheinen statt sich zu ergänzen — evtl.
    Interaktionseffekt, der eine gemeinsame statt getrennte Kalibrierung
@@ -205,3 +288,6 @@ mit starker Reversion schneidet besser ab als der aktuelle Default (0.15)
    Upload-Automatisierung (`deploy/bot11-log-upload.*`) ist laut
    `ssh_help.md` nie fertig eingerichtet worden und sollte für
    kontinuierliches Sammeln nachgezogen werden.
+4. Optional: `momentum_mu()`/`reversion_mu()` gegen Chainlink- statt
+   Binance-Ticks testen, angesichts des in Abschnitt 8 gefundenen
+   ~1-2s-Lags und systematischen Bias.

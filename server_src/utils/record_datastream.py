@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 from datastream import (
     BinanceKlineEvent,
     ChainlinkPriceEvent,
+    ChainlinkRawPriceEvent,
     DatastreamLayer,
     PolymarketPriceChangeEvent,
     WindowCloseEvent,
@@ -48,6 +49,8 @@ from datastream.feeds.chainlink_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_C
 from datastream.feeds.chainlink_feed import DEFAULT_STALE_TIMEOUT as DEFAULT_CHAINLINK_STALE_TIMEOUT
 from datastream.feeds.chainlink_feed import DEFAULT_SYMBOL as DEFAULT_CHAINLINK_SYMBOL
 from datastream.feeds.chainlink_feed import DEFAULT_WINDOW_SECONDS as DEFAULT_CHAINLINK_WINDOW_SECONDS
+from datastream.feeds.chainlink_raw_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_CHAINLINK_RAW_RECONNECT_DELAY
+from datastream.feeds.chainlink_raw_feed import DEFAULT_STALE_TIMEOUT as DEFAULT_CHAINLINK_RAW_STALE_TIMEOUT
 from datastream.feeds.polymarket_feed import DEFAULT_APP_PING_INTERVAL, DEFAULT_POLYMARKET_POLL_INTERVAL
 from datastream.feeds.polymarket_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_POLYMARKET_RECONNECT_DELAY
 from datastream.utils.gamma_client import DEFAULT_WINDOW_SECONDS
@@ -79,6 +82,7 @@ _EVENT_TAGS = {
     WindowCloseEvent: "window_close",
     PolymarketPriceChangeEvent: "polymarket_price_change",
     ChainlinkPriceEvent: "chainlink_price",
+    ChainlinkRawPriceEvent: "chainlink_raw_price",
 }
 
 
@@ -139,6 +143,12 @@ def _build_datastream_layer() -> DatastreamLayer:
         ),
         chainlink_stale_timeout=env_config.env_float(
             "DATASTREAM_CHAINLINK_STALE_TIMEOUT_SECONDS", DEFAULT_CHAINLINK_STALE_TIMEOUT
+        ),
+        chainlink_raw_reconnect_delay=env_config.env_float(
+            "DATASTREAM_CHAINLINK_RAW_RECONNECT_DELAY_SECONDS", DEFAULT_CHAINLINK_RAW_RECONNECT_DELAY
+        ),
+        chainlink_raw_stale_timeout=env_config.env_float(
+            "DATASTREAM_CHAINLINK_RAW_STALE_TIMEOUT_SECONDS", DEFAULT_CHAINLINK_RAW_STALE_TIMEOUT
         ),
         window_seconds=env_config.env_float("DATASTREAM_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS),
         prefetch_lead_seconds=env_config.env_float(

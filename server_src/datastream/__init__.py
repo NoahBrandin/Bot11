@@ -1,6 +1,7 @@
 from datastream.utils.events import (
     BinanceKlineEvent,
     ChainlinkPriceEvent,
+    ChainlinkRawPriceEvent,
     Event,
     Outcome,
     PolymarketPriceChangeEvent,
@@ -14,6 +15,7 @@ from datastream.utils.window_tracker import slug_for
 __all__ = [
     "BinanceKlineEvent",
     "ChainlinkPriceEvent",
+    "ChainlinkRawPriceEvent",
     "DatastreamLayer",
     "Event",
     "Outcome",

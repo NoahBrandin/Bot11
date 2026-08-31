@@ -25,6 +25,9 @@ from datastream.feeds.chainlink_feed import DEFAULT_STALE_TIMEOUT as DEFAULT_CHA
 from datastream.feeds.chainlink_feed import DEFAULT_SYMBOL as DEFAULT_CHAINLINK_SYMBOL
 from datastream.feeds.chainlink_feed import DEFAULT_WINDOW_SECONDS as DEFAULT_CHAINLINK_WINDOW_SECONDS
 from datastream.feeds.chainlink_feed import ChainlinkFeed
+from datastream.feeds.chainlink_raw_feed import DEFAULT_RECONNECT_DELAY as DEFAULT_CHAINLINK_RAW_RECONNECT_DELAY
+from datastream.feeds.chainlink_raw_feed import DEFAULT_STALE_TIMEOUT as DEFAULT_CHAINLINK_RAW_STALE_TIMEOUT
+from datastream.feeds.chainlink_raw_feed import ChainlinkRawFeed
 from datastream.utils.gamma_client import DEFAULT_WINDOW_SECONDS, GammaClient, WindowMarket
 from datastream.feeds.polymarket_feed import (
     DEFAULT_APP_PING_INTERVAL,
@@ -51,6 +54,8 @@ class DatastreamLayer:
         chainlink_window_seconds: int = DEFAULT_CHAINLINK_WINDOW_SECONDS,
         chainlink_reconnect_delay: float = DEFAULT_CHAINLINK_RECONNECT_DELAY,
         chainlink_stale_timeout: float = DEFAULT_CHAINLINK_STALE_TIMEOUT,
+        chainlink_raw_reconnect_delay: float = DEFAULT_CHAINLINK_RAW_RECONNECT_DELAY,
+        chainlink_raw_stale_timeout: float = DEFAULT_CHAINLINK_RAW_STALE_TIMEOUT,
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
         prefetch_lead_seconds: float = DEFAULT_PREFETCH_LEAD_SECONDS,
         window_fetch_retry_delay: float = DEFAULT_FETCH_RETRY_DELAY,
@@ -78,6 +83,16 @@ class DatastreamLayer:
             monitor=self._monitor,
             reconnect_delay=chainlink_reconnect_delay,
             stale_timeout=chainlink_stale_timeout,
+        )
+        # Measurement-only for now -- see chainlink_raw_feed.py's module
+        # docstring. Uses the same chainlink_symbol as the TWAP feed above,
+        # not a separately configurable one; nothing consumes this yet.
+        self._chainlink_raw_feed = ChainlinkRawFeed(
+            self.queue,
+            symbol=chainlink_symbol,
+            monitor=self._monitor,
+            reconnect_delay=chainlink_raw_reconnect_delay,
+            stale_timeout=chainlink_raw_stale_timeout,
         )
         self._window_seconds = window_seconds
         self._prefetch_lead_seconds = prefetch_lead_seconds
@@ -107,5 +122,6 @@ class DatastreamLayer:
                 self._binance_feed.run(),
                 self._polymarket_feed.run(),
                 self._chainlink_feed.run(),
+                self._chainlink_raw_feed.run(),
                 window_tracker.run(),
             )

@@ -104,3 +104,18 @@ class ChainlinkPriceEvent(Event):
     # resolution text, see chainlink_feed.py's module docstring).
     window_seconds: int
     source_timestamp: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChainlinkRawPriceEvent(Event):
+    """The un-windowed Chainlink tick, not the 60s TWAP ChainlinkPriceEvent
+    carries -- see chainlink_raw_feed.py's module docstring for why this
+    exists as a separate feed/event rather than reusing ChainlinkPriceEvent
+    with window_seconds=0. Not (yet) consumed by StrategyLayer; recorded
+    alongside everything else purely to measure real tick density before
+    deciding whether it's dense enough to replace BinanceKlineEvent as the
+    momentum_mu()/reversion_mu()/GBMEstimator input."""
+
+    symbol: str
+    price: float
+    source_timestamp: float

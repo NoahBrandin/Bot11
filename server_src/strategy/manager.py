@@ -57,6 +57,7 @@ from typing import Callable, Optional
 from datastream.utils.events import (
     BinanceKlineEvent,
     ChainlinkPriceEvent,
+    ChainlinkRawPriceEvent,
     Event,
     Outcome,
     PolymarketPriceChangeEvent,
@@ -121,14 +122,6 @@ DEFAULT_LATE_JOIN_THRESHOLD_SECONDS = 5.0
 # GBM estimator's actual tick-to-tick noise; this default needs empirical
 # tuning (e.g. a paper-mode observation run) before being trusted live.
 DEFAULT_PROBABILITY_MARGIN = 0.07
-# No longer consumed: probability_model.py's GBMEstimator was EWMA-based (this picked its
-# recency-weighting halflife, validated by a 2026-08-22 backtest sweep) until
-# it was replaced by a two-scale-realized-variance estimator -- see
-# probability_model.py's module docstring. Kept as a StrategyLayer.__init__
-# parameter/Config field rather than removed outright, since ripping it out
-# would ripple into orchestrator.py/config.py for no behavioral gain;
-# ewma_halflife_seconds is accepted but ignored below.
-DEFAULT_EWMA_HALFLIFE_SECONDS: Optional[float] = 30.0
 # Disabled by default -- see StrategyLayer._state_file_path.
 DEFAULT_STATE_FILE_PATH = ""
 # Tells probability_model.py's GBMEstimator what spacing to assume between the price
@@ -151,7 +144,14 @@ DEFAULT_TICK_BUFFER_SECONDS = 90.0
 # above ~45s -- see the code-review finding this was written to avoid).
 DEFAULT_REVERSION_BUFFER_SLACK_SECONDS = 30.0
 
-_INTERVAL_SECONDS = {"1s": 1.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
+# "2s" added alongside Binance's own kline-stream intervals: BinanceFeed
+# forwards every kline WS message (open candles included, see
+# binance_feed.py), and Binance's actual push cadence for that stream
+# measures ~2.0s median in production traffic, not the ~1s BINANCE_TICK_
+# INTERVAL default assumed -- GBMEstimator.sigma silently overstates
+# calendar-time-per-sample (and so sigma itself) by ~1.4x at the wrong
+# assumption, so this needs to match reality, not just be "close enough".
+_INTERVAL_SECONDS = {"1s": 1.0, "2s": 2.0, "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0, "1h": 3600.0}
 
 
 def _interval_seconds(interval: str) -> float:
@@ -204,7 +204,6 @@ class StrategyLayer:
         kelly_multiplier: float = DEFAULT_KELLY_MULTIPLIER,
         state_file_path: str = DEFAULT_STATE_FILE_PATH,
         late_join_threshold: float = DEFAULT_LATE_JOIN_THRESHOLD_SECONDS,
-        ewma_halflife_seconds: Optional[float] = DEFAULT_EWMA_HALFLIFE_SECONDS,
         gbm_tick_interval: str = DEFAULT_GBM_TICK_INTERVAL,
         momentum_window_seconds: float = DEFAULT_MOMENTUM_WINDOW_SECONDS,
         momentum_z_cap: float = DEFAULT_MOMENTUM_Z_CAP,
@@ -227,7 +226,6 @@ class StrategyLayer:
         self._history_size = history_size
         self._binance_symbol = binance_symbol
         self._binance_interval = binance_interval
-        self._ewma_halflife_seconds = ewma_halflife_seconds  # accepted, unused -- see DEFAULT_EWMA_HALFLIFE_SECONDS
         self._gbm_tick_interval = gbm_tick_interval  # "" -- see DEFAULT_GBM_TICK_INTERVAL
         self._gbm = GBMEstimator(
             history_size, tick_interval_seconds=_interval_seconds(gbm_tick_interval or binance_interval)
@@ -290,9 +288,28 @@ class StrategyLayer:
         # subsample_k*tick_interval_seconds (~2 minutes at the 1s/120 default)
         # after every restart before the last subgrid catches up and trading
         # can resume -- exactly the "GBM not ready" gap seen after a restart.
+        #
+        # NOTE (2026-08-30): this still seeds from Binance REST history even
+        # though live ticks now come from raw Chainlink (see
+        # _on_chainlink_raw_price) -- there's no Chainlink REST history to
+        # seed from instead (chainlink_feed.py's module docstring: SDK
+        # subscription only, no historical endpoint), so this is a
+        # deliberately imperfect warm-start (fills the subsample grids fast
+        # to avoid the restart gap) rather than a claim the two sources are
+        # equivalent. Left in rather than removed -- dropping it back to a
+        # cold start would reintroduce the exact restart gap this bootstrap
+        # was added to fix, for an unmeasured (possibly small) benefit.
+        # interval=self._binance_interval, not self._gbm_tick_interval --
+        # gbm_tick_interval (e.g. "2s") is a calibration spacing assumption
+        # for GBMEstimator (see _interval_seconds above), not a real Binance
+        # REST kline granularity. Binance's klines endpoint only supports
+        # 1s/1m/3m/5m/.../1h etc -- there is no "2s" interval on the API --
+        # so passing gbm_tick_interval straight through here raises
+        # ValueError("Unknown Binance interval '2s'") the moment it's set to
+        # something Binance doesn't offer.
         closes = await fetch_recent_closes(
             symbol=self._binance_symbol,
-            interval=self._gbm_tick_interval or self._binance_interval,
+            interval=self._binance_interval,
             count=self._history_size + self._gbm.subsample_k,
         )
         self._gbm.seed(closes)
@@ -321,6 +338,8 @@ class StrategyLayer:
                 await self._on_binance_kline(event)
             case ChainlinkPriceEvent():
                 await self._on_chainlink_price(event)
+            case ChainlinkRawPriceEvent():
+                await self._on_chainlink_raw_price(event)
             case PolymarketPriceChangeEvent():
                 await self._on_price_change(event)
 
@@ -386,17 +405,43 @@ class StrategyLayer:
         )
 
     async def _on_binance_kline(self, event: BinanceKlineEvent) -> None:
-        self._gbm.add_price(event.close)
-        self._recent_ticks.add(self._clock(), event.close)
-        self._reversion_ticks.add(self._clock(), event.close)
-        if event.is_closed:
-            await self._evaluate()
+        # No longer feeds GBM/momentum/reversion -- see _on_chainlink_raw_
+        # price below (2026-08-30: switched the mu/sigma tick source from
+        # Binance to raw Chainlink ticks, to remove the small systematic
+        # lag/bias a live recording found between the two -- see
+        # md/backtest_recording_mu_calibration_2026-08-30.md, section 8).
+        # BinanceKlineEvent is still recorded and still flows through here
+        # (DatastreamLayer keeps BinanceFeed running) purely so it stays
+        # available for monitoring/comparison; StrategyLayer itself no
+        # longer acts on it.
+        pass
 
     async def _on_chainlink_price(self, event: ChainlinkPriceEvent) -> None:
         self._current_price = event.price
         self._current_price_timestamp = event.source_timestamp
         self._chainlink_window_seconds = event.window_seconds
         self._try_capture_target_price(event.price, event.source_timestamp)
+
+    async def _on_chainlink_raw_price(self, event: ChainlinkRawPriceEvent) -> None:
+        # Un-windowed Chainlink ticks now drive GBM/momentum/reversion --
+        # see _on_binance_kline's comment above for why. Unlike Binance's
+        # kline stream, a raw Chainlink tick has no is_closed concept (no
+        # "candle" to wait for) -- every tick is itself a fresh, independent
+        # data point, so every tick both updates the estimators and
+        # triggers evaluation, same as Binance's is_closed=True ticks used
+        # to. NOTE (2026-08-30): the real tick cadence of this feed is
+        # unmeasured -- Chainlink oracle networks classically update on a
+        # deviation-threshold-or-heartbeat basis, which could be far sparser
+        # than Binance's ~1-2s kline push cadence. If so, TwoScaleRealized
+        # Variance's subsample grids (calibrated assuming dense, ~1s-spaced
+        # ticks -- see gbm_tick_interval) and momentum_mu()'s/reversion_mu()'s
+        # short/long windows may need re-tuning once the real cadence is
+        # known from a live recording with this feed enabled (see
+        # chainlink_raw_feed.py's module docstring).
+        self._gbm.add_price(event.price)
+        self._recent_ticks.add(self._clock(), event.price)
+        self._reversion_ticks.add(self._clock(), event.price)
+        await self._evaluate()
 
     async def _on_price_change(self, event: PolymarketPriceChangeEvent) -> None:
         if self._window is None or event.slug != self._window.slug:

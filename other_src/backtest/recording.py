@@ -28,6 +28,7 @@ from typing import Optional
 from datastream.utils.events import (
     BinanceKlineEvent,
     ChainlinkPriceEvent,
+    ChainlinkRawPriceEvent,
     Event,
     Outcome,
     PolymarketPriceChangeEvent,
@@ -44,6 +45,7 @@ _EVENT_TYPES: dict[str, type] = {
     "window_close": WindowCloseEvent,
     "polymarket_price_change": PolymarketPriceChangeEvent,
     "chainlink_price": ChainlinkPriceEvent,
+    "chainlink_raw_price": ChainlinkRawPriceEvent,
 }
 _ENUM_FIELDS = {"outcome": Outcome, "side": Side}
 # Precomputed once per event class rather than calling dataclasses.fields()
