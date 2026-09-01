@@ -12,11 +12,16 @@
 #
 # Logs:
 #   journalctl -u bot11-recorder -f
-#   Also written as JSON Lines to a rotating file at
-#   $LOGS_DIRECTORY/datastream.jsonl (50MB x 10 backups) -- see LogsDirectory=
-#   below and record_datastream.py::_configure_logging(). Override the path
-#   with DATASTREAM_LOG_FILE_PATH in .env, or set it to an empty string to
-#   disable the file and keep stdout/journal-only.
+#   Shows only WARNING+ (feed reconnects/stale-timeouts, startup/shutdown
+#   from systemd itself) -- record_datastream.py::_configure_logging() caps
+#   its stderr handler there deliberately, since duplicating the full
+#   per-tick INFO firehose into the journal on top of the file below cost
+#   ~250MB journald RSS and >1GB unbounded journal disk on this instance.
+#   Every event (INFO and up) is written to a rotating file at
+#   $LOGS_DIRECTORY/datastream.jsonl (50MB x 100 backups) -- see
+#   LogsDirectory= below. Override the path with DATASTREAM_LOG_FILE_PATH in
+#   .env, or set it to an empty string to disable the file and fall back to
+#   the (now WARNING+-only) stderr/journal.
 #   See deploy/bot11-log-upload.service/.timer for shipping finished
 #   (rotated) segments off-box to Google Drive.
 #

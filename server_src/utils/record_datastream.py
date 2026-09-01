@@ -98,6 +98,16 @@ def _configure_logging() -> None:
     formatter = JsonLinesFormatter()
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
+    # StreamHandler defaults to stderr, which systemd captures into the
+    # journal (see deploy/bot11-recorder.service's StandardError=journal) --
+    # at this feed's tick volume (every single event, not just closed
+    # candles/reconnects) that duplicated the full firehose into journald on
+    # top of the file handler below, measured costing journald ~250MB RSS
+    # and >1GB of unbounded journal disk on the recorder's small instance.
+    # WARNING+ still reaches the journal (feed reconnects/stale-timeouts,
+    # see chainlink_feed.py) -- only the per-tick INFO firehose is dropped
+    # from this handler; the file handler keeps every event regardless.
+    stream_handler.setLevel(logging.WARNING)
     handlers: list[logging.Handler] = [stream_handler]
 
     # Same LOGS_DIRECTORY/LOG_FILE_PATH convention as orchestrator.py::main()
